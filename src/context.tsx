@@ -11,7 +11,7 @@ export type HedwigProviderProps = {
 }
 
 export function HedwigProvider({ url, verbosity, children }: HedwigProviderProps) {
-    const service = useRef<Service>(null);
+    const service = useRef<Service | null>(null);
     if (service.current === null) {
         service.current = new Service(url, verbosity);
     }

@@ -35,7 +35,7 @@ export function useChannel<M, S>(
         throw new Error('useChannel must be used within a HedwigProvider');
     }
 
-    const ctrl = useRef<AbortController>(null);
+    const ctrl = useRef<AbortController | null>(null);
     if (ctrl.current === null) {
         ctrl.current = new AbortController();
     }

@@ -95,10 +95,10 @@ export class Service extends EventEmitter<{
     #reconnectAttempts = 0;
 
     /** Timer for scheduling the next reconnection attempt */
-    #reconnectTimer: number | null = null;
+    #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
     /** Timer for scheduling a graceful disconnect when no subscriptions are active */
-    #gracefulDisconnectTimer: number | null = null;
+    #gracefulDisconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
     /** Indicates whether the service has been terminated */
     #terminated: boolean = false;
