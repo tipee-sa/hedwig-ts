@@ -1,5 +1,5 @@
 import { HedwigToken } from './token';
-import { ClientMessageMap, ClientOp, ErrorCode, ServerMessage, ServerOp, ServerResultFor, ServerResultType } from './proto';
+import { ClientMessageMap, ClientOp, ErrorCode, ServerMessage, ServerResultFor } from './proto';
 import { Option, Result, sleep } from './util';
 import { ConsoleLogger, Level, Logger } from './logger';
 import { Operation, StateBuffer, StateSetter, StateSource } from './state';
@@ -11,52 +11,26 @@ export type Authorizer = (s: AbortSignal) => string | Promise<string>;
 const ERR_DISCONNECTED = Symbol('ERR_DISCONNECTED');
 
 /**
- * A ServerError wraps the error code, message, and any additional detail
+ * A ServerError wraps the error code and any additional detail
  * returned by the server when an operation fails.
  */
 export class ServerError<C extends ErrorCode, T> extends Error {
-    constructor(readonly code: C, readonly message: string, readonly detail: T) {
-        super(`[E${code}] ${message}`);
+    constructor(readonly code: C, readonly detail: T) {
+        const name = Object.entries(ErrorCode).filter(([_, value]) => value === code).map(([name]) => name)[0] ?? 'Unknown';
+        super(`[E${code}] ${name}`);
         this.name = this.constructor.name;
     }
 }
 
-/**
- * An abstract, type-safe, event emitter. `EventMap` must be a mapping of
- * event names to their payload types.
- */
-abstract class EventEmitter<EventMap> {
-    /**
-     * The underlying event target used to manage listeners and dispatch events.
-     * Its methods are wrapped by the `EventEmitter` to provide a type-safe API.
-     */
+export abstract class EventEmitter {
     #eventTarget: EventTarget = new EventTarget();
 
-    /** Adds an event listener to this emitter. */
-    addEventListener<K extends keyof EventMap & string>(
-        type: K,
-        callback: (ev: CustomEvent<EventMap[K]>) => void,
-        options?: AddEventListenerOptions
-    ): void {
+    dispatchEvent(event: string, detail: unknown): boolean {
+        return this.#eventTarget.dispatchEvent(new CustomEvent(event, { detail }));
+    }
+
+    addEventListener(type: string, callback: (e: CustomEvent) => void, options?: AddEventListenerOptions): void {
         this.#eventTarget.addEventListener(type, callback as EventListener, options);
-    }
-
-    /** Removes an event listener from this emitter. */
-    removeEventListener<K extends keyof EventMap & string>(
-        type: K,
-        callback: (ev: CustomEvent<EventMap[K]>) => void,
-        options?: EventListenerOptions
-    ): void {
-        this.#eventTarget.removeEventListener(type, callback as EventListener, options);
-    }
-
-    /** Dispatches an event from this emitter. */
-    dispatchEvent<K extends keyof EventMap & string>(
-        type: K,
-        detail: EventMap[K],
-        cancelable: boolean = false
-    ): boolean {
-        return this.#eventTarget.dispatchEvent(new CustomEvent(type, { detail, cancelable }));
     }
 }
 
@@ -66,10 +40,7 @@ abstract class EventEmitter<EventMap> {
  * subscriptions, and share resources if multiple subscriptions are using the
  * same channel.
  */
-export class Service extends EventEmitter<{
-    'socket:up': Map<string, HedwigToken>;
-    'socket:down': CloseEvent;
-}> {
+export class Service extends EventEmitter {
     /** The logger instance */
     readonly #logger: Logger;
 
@@ -158,7 +129,7 @@ export class Service extends EventEmitter<{
      * @typeParam M - The type of the message payload.
      * @typeParam S - The type of the state payload.
      */
-    subscribe<M, S>(signal: AbortSignal, authorizer: Authorizer): SubscriptionHandle<M, S> {
+    subscribe(signal: AbortSignal, authorizer: Authorizer): SubscriptionHandle {
         if (this.#terminated) {
             throw new Error('Service has been terminated');
         }
@@ -169,7 +140,7 @@ export class Service extends EventEmitter<{
             this.#gracefulDisconnectTimer = null;
         }
 
-        const subscription = new Subscription<M, S>(this, signal, authorizer);
+        const subscription = new Subscription(this, signal, authorizer);
         this.#subscriptions.add(subscription);
         this.#connect();
 
@@ -204,7 +175,7 @@ export class Service extends EventEmitter<{
                 oldChannel.close();
                 this.#channels.delete(oldChannel.name);
                 if (this.isConnected) {
-                    this.send({ [ClientOp.Leave]: [oldChannel.name] }).catch((err) => {
+                    this.send(ClientOp.Leave, { channel: oldChannel.name }).catch((err) => {
                         // Ignore disconnect errors when leaving.
                         if (err !== ERR_DISCONNECTED) {
                             throw err;
@@ -237,7 +208,7 @@ export class Service extends EventEmitter<{
             // Send the token to either join or renew the subscription
             if (this.isConnected) {
                 try {
-                    await this.send({ [ClientOp.Join]: [token.raw] });
+                    await this.send(ClientOp.Join, { token: token.raw });
                     channel.isConnected = true;
                 } catch (err) {
                     if (err !== ERR_DISCONNECTED) {
@@ -321,13 +292,13 @@ export class Service extends EventEmitter<{
      * Sends a message to the server and returns a promise that resolves to the
      * server's response.
      */
-    send<T, O extends ClientOp>(message: ClientMessageMap[O]): Promise<ServerResultFor<O, T>> {
+    send<T, O extends ClientOp>(op: O, data: ClientMessageMap[O]): Promise<ServerResultFor<O, T>> {
         if (!this.#socket || this.#socket.readyState !== WebSocket.OPEN) {
             return Promise.reject(ERR_DISCONNECTED);
         }
 
         const oid = ++this.#nextOID;
-        const serialized = JSON.stringify([oid, message]);
+        const serialized = JSON.stringify({ id: oid, op, ...data });
 
         this.#socket.send(serialized);
 
@@ -359,7 +330,9 @@ export class Service extends EventEmitter<{
             // This must be the first message sent once the connection is ready
             // to match the bootstrap protocol.
             try {
-                await this.send({ [ClientOp.Join]: tokens });
+                for (const token of tokens) {
+                    await this.send(ClientOp.Join, { token });
+                }
                 for (const name of channelToRejoin.keys()) {
                     const channel = this.#channels.get(name);
                     if (channel) {
@@ -376,61 +349,28 @@ export class Service extends EventEmitter<{
 
     readonly #onMessage = (e: MessageEvent) => {
         const message = JSON.parse(e.data) as ServerMessage;
-        switch (true) {
-            case ServerOp.Message in message: {
-                const [channelName, payload] = message[ServerOp.Message];
-                const channel = this.#channels.get(channelName);
+        if ('res' in message) {
+            const resolver = this.#requests.get(message.res);
+            if (resolver) {
+                this.#requests.delete(message.res);
+                if ('error' in message) {
+                    const { error, details } = message;
+                    resolver.resolve(Result.err(new ServerError(error, details)));
+                } else {
+                    resolver.resolve(Result.ok(message.data));
+                }
+            }
+        } else if ('event' in message) {
+            if ('channel' in message) {
+                const channel = this.#channels.get(message.channel!);
                 if (channel) {
-                    channel.dispatchMessage(payload);
+                    channel.dispatchToSubscriptions(message.event, message.data);
                 }
-                return;
+            } else {
+                this.dispatchEvent(message.event, message.data);
             }
-
-            case ServerOp.State in message: {
-                const [channelName, [state, revision]] = message[ServerOp.State];
-                const channel = this.#channels.get(channelName);
-                if (channel) {
-                    channel.dispatchState(state, revision);
-                }
-                return;
-            }
-
-            case ServerOp.Presence in message: {
-                const [channelName, presence] = message[ServerOp.Presence];
-                const channel = this.#channels.get(channelName);
-                if (channel) {
-                    channel.dispatchPresence(presence);
-                }
-                return;
-            }
-
-            case ServerOp.Response in message: {
-                const [oid, result] = message[ServerOp.Response];
-                const resolver = this.#requests.get(oid);
-                if (resolver) {
-                    this.#requests.delete(oid);
-                    if (!result) {
-                        resolver.resolve(Result.ok(undefined)); // No result, resolve with undefined
-                    } else if (ServerResultType.Success in result) {
-                        resolver.resolve(Result.ok(result[ServerResultType.Success]));
-                    } else if (ServerResultType.Error in result) {
-                        const [code, message, detail] = result[ServerResultType.Error];
-                        resolver.resolve(Result.err(new ServerError(code, message, detail)));
-                    } else {
-                        this.#logger.error('Invalid server response:', result);
-                        resolver.reject(new Error('Invalid server response'));
-                    }
-                }
-                return;
-            }
-
-            case ServerOp.ChannelClosed in message: {
-                throw new Error('NYI: Channel closed notifications are not yet implemented');
-                return;
-            }
-
-            default:
-                this.#logger.warn('Unhandled message:', message);
+        } else {
+            this.#logger.warn('Unhandled message:', message);
         }
     }
 
@@ -446,7 +386,6 @@ export class Service extends EventEmitter<{
 
         for (const channel of this.#channels.values()) {
             channel.isConnected = false;
-            channel.dispatchPresence([]); // Clear presence on disconnect
         }
 
         // Cancel all outgoing requests
@@ -468,10 +407,7 @@ export class Service extends EventEmitter<{
  * A Channel is a single Hedwig channel. A single instance is shared by all
  * subscriptions that use the same channel name.
  */
-class Channel<M = any, S = any> extends EventEmitter<{
-    'channel:up': void;
-    'channel:down': void;
-}> {
+class Channel extends EventEmitter {
     /** The abort controller used to cancel operations on this channel on close */
     #abort = new AbortController();
 
@@ -479,24 +415,13 @@ class Channel<M = any, S = any> extends EventEmitter<{
     #isConnected = false;
 
     /** The set of subscriptions using this channel */
-    #subscriptions = new Set<Subscription<M, S>>();
-
-    /** The state buffer for this channel */
-    #stateBuffer = new StateBuffer<S>();
-
-    /** The upstream for the state buffer, used to implement the actual state synchronization */
-    #stateSource: StateSource<S>;
-
-    /** The presence set for this channel */
-    #presence: string[] = [];
+    #subscriptions = new Set<Subscription>();
 
     constructor(
         readonly name: string,
         private readonly service: Service,
     ) {
         super();
-        this.#stateSource = new ChannelState(this, this.#abort.signal, this.service);
-        this.#stateBuffer.upstream = this.#stateSource;
     }
 
     get isConnected(): boolean {
@@ -537,14 +462,12 @@ class Channel<M = any, S = any> extends EventEmitter<{
     }
 
     /** Adds a subscription to this channel. */
-    addSubscription(sub: Subscription<M, S>) {
+    addSubscription(sub: Subscription) {
         this.#subscriptions.add(sub);
-        sub.stateUpstream = this.#stateBuffer;
-        sub.dispatchEvent('channel:presence', this.#presence);
     }
 
     /** Removes a subscription from this channel. */
-    removeSubscription(sub: Subscription<M, S>): boolean {
+    removeSubscription(sub: Subscription): boolean {
         return this.#subscriptions.delete(sub);
     }
 
@@ -553,23 +476,9 @@ class Channel<M = any, S = any> extends EventEmitter<{
         return this.#subscriptions.size > 0;
     }
 
-    /** Dispatches a message from the server. */
-    dispatchMessage(message: M): void {
+    dispatchToSubscriptions(event: string, data: unknown) {
         for (const sub of this.#subscriptions) {
-            sub.dispatchEvent('channel:message', message);
-        }
-    }
-
-    /** Dispatches a state update from the server. */
-    dispatchState(state: unknown, revision: string) {
-        this.#stateSource.sync(Option.some(state as S), revision);
-    }
-
-    /** Dispatches a presence update from the server. */
-    dispatchPresence(presence: string[]): void {
-        this.#presence = presence;
-        for (const sub of this.#subscriptions) {
-            sub.dispatchEvent('channel:presence', presence);
+            sub.dispatchEvent(event, data);
         }
     }
 
@@ -580,82 +489,11 @@ class Channel<M = any, S = any> extends EventEmitter<{
 }
 
 /**
- * A ChannelState is a `StateSource` that implements the actual synchronization
- * logic between the client-side channel state and the server-side state.
- */
-class ChannelState<S> extends StateSource<S> {
-    constructor(
-        private readonly channel: Channel<any, S>,
-        private readonly signal: AbortSignal,
-        private readonly service: Service,
-    ) {
-        super();
-    }
-
-    protected async processOperations(poll: () => Operation<S> | undefined): Promise<void> {
-        for (let op = poll(); op; op = poll()) {
-            await this.#sendState(op);
-        }
-    }
-
-    async #sendState(operation: Operation<S>): Promise<void> {
-        const op = { ...operation }; // Clone the operation to avoid modifying the original
-        while (!this.signal.aborted) {
-            await this.channel.upPromise(this.signal);
-            try {
-                let res = await this.service.send<S, ClientOp.SetState>({
-                    [ClientOp.SetState]: [this.channel.name, op.value, op.revision],
-                });
-                if (res.isErr()) {
-                    const err = res.value;
-                    if (err.code === ErrorCode.WrongRevision) {
-                        if ('v' in err.detail) {
-                            if (op.mode === 'merge' && !op.weak) {
-                                op.value = op.fn(err.detail.v);
-                                op.revision = err.detail.r;
-                                continue;
-                            } else {
-                                // If the operation was a put or a weak-merge, let's drop the change altogether.
-                                return;
-                            }
-                        } else {
-                            // There is no value on the server-side. It usually means that the state was reset.
-                            // We retry using the correct revision for any type of operation.
-                            op.revision = err.detail.r;
-                            continue;
-                        }
-                    }
-                    else {
-                        // Some other error occurred, we should not retry.
-                        throw err;
-                    }
-                }
-                return; // Done
-            }
-            catch (err) {
-                if (err === ERR_DISCONNECTED) {
-                    continue;
-                }
-                console.error('Failed to send state update:', err);
-                return;
-            }
-        }
-    }
-}
-
-/** Events emitted by a `Subscription` */
-type SubscriptionEventMap<M, S> = {
-    'channel:message': M;
-    'channel:state': S;
-    'channel:presence': string[];
-};
-
-/**
  * A Subscription is a single lease on a channel. It maps 1:1 to a `useChannel`
  * hook from the public API, and is responsible for managing the lifetime of
  * the subscription, including renewing the token and handling reconnection.
  */
-class Subscription<M = any, S = any> extends EventEmitter<SubscriptionEventMap<M, S>> {
+class Subscription extends EventEmitter {
     static #nextSubscriptionId = 0;
 
     /** The unique ID of this subscription */
@@ -664,9 +502,6 @@ class Subscription<M = any, S = any> extends EventEmitter<SubscriptionEventMap<M
     /** The logger instance for this subscription */
     readonly #logger: Logger;
 
-    /** The state buffer for this subscription */
-    readonly #stateBuffer = new StateBuffer<S>();
-
     constructor(
         readonly service: Service,
         readonly signal: AbortSignal,
@@ -674,13 +509,7 @@ class Subscription<M = any, S = any> extends EventEmitter<SubscriptionEventMap<M
     ) {
         super();
         this.#logger = service.makeLogger(`S:${this.#subscriptionId}`);
-        this.#stateBuffer.subscribe((state) => state.isSome() && this.dispatchEvent('channel:state', state.value));
         this.#run(); // Async
-    }
-
-    /** Updates the upstream for the state buffer for this subscription. */
-    set stateUpstream(upstream: StateBuffer<S> | undefined) {
-        this.#stateBuffer.upstream = upstream;
     }
 
     /** The main lifecycle of this subscription, will run until terminated. */
@@ -792,15 +621,6 @@ class Subscription<M = any, S = any> extends EventEmitter<SubscriptionEventMap<M
         }
         throw new Error('Authorization failed after too many attempts');
     }
-
-    // State proxying
-    getState(): Option<S> { return this.#stateBuffer.getState(); }
-    setState(setter: StateSetter<S>, weak: boolean): void { this.#stateBuffer.setState(setter, weak); }
-
-    getPresence(): string[] {
-        // Presence is not implemented in this version, return an empty array
-        return [];
-    }
 }
 
 /**
@@ -810,12 +630,12 @@ class Subscription<M = any, S = any> extends EventEmitter<SubscriptionEventMap<M
  * @typeParam M - The type of the message payload.
  * @typeParam S - The type of the state payload.
  */
-export class SubscriptionHandle<M, S> {
+export class SubscriptionHandle {
     /** The internal subscription state */
-    #subscription: Subscription<M, S>;
+    #subscription: Subscription;
 
     /** @internal */
-    constructor(subscription: Subscription<M, S>) {
+    constructor(subscription: Subscription) {
         this.#subscription = subscription;
     }
 
@@ -825,37 +645,14 @@ export class SubscriptionHandle<M, S> {
     }
 
     /** Adds an event listener to the subscription. */
-    addEventListener<K extends keyof SubscriptionEventMap<M, S>>(
-        type: K,
-        callback: (ev: CustomEvent<SubscriptionEventMap<M, S>[K]>) => void,
+    addEventListener<E>(
+        type: string,
+        callback: (ev: CustomEvent<E>) => void,
         options?: AddEventListenerOptions
     ): void {
         if (this.canceled) {
             throw new Error('Cannot add event listener to a canceled subscription');
         }
         this.#subscription.addEventListener(type, callback as EventListener, options);
-    }
-
-    /** Removes an event listener from the subscription. */
-    removeEventListener<K extends keyof SubscriptionEventMap<M, S>>(
-        type: K,
-        callback: (ev: CustomEvent<SubscriptionEventMap<M, S>[K]>) => void,
-        options?: EventListenerOptions
-    ): void {
-        this.#subscription.removeEventListener(type, callback as EventListener, options);
-    }
-
-    /** Gets the current state of the channel. */
-    get state(): Option<S> {
-        return this.#subscription.getState();
-    }
-
-    /** Updates the state of the channel. */
-    setState(setter: StateSetter<S>, weak: boolean = false): void {
-        this.#subscription.setState(setter, weak);
-    }
-
-    get presence(): string[] {
-        return this.#subscription.getPresence();
     }
 }

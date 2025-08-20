@@ -26,10 +26,10 @@ function useAbortableEffect(
  * calling the backend server) that will be used to join the channel. This
  * token will be automatically refreshed when it expires.
  */
-export function useChannel<M, S>(
+export function useChannel(
     authorizer: Authorizer,
     deps: React.DependencyList,
-): SubscriptionHandle<M, S> {
+): SubscriptionHandle {
     const service = useContext(Context);
     if (service === null) {
         throw new Error('useChannel must be used within a HedwigProvider');
@@ -40,7 +40,7 @@ export function useChannel<M, S>(
         ctrl.current = new AbortController();
     }
 
-    const [subscription, setSubscription] = useState<SubscriptionHandle<M, S>>(
+    const [subscription, setSubscription] = useState<SubscriptionHandle>(
         () => service.subscribe(ctrl.current!.signal, authorizer),
     );
 
@@ -68,12 +68,12 @@ export function useChannel<M, S>(
  * If the channel is unavailable, this hook does nothing.
  */
 export function useChannelMessages<M>(
-    subscription: SubscriptionHandle<M, any>,
+    subscription: SubscriptionHandle,
     handler: (message: M) => void,
     deps: React.DependencyList,
 ) {
     useAbortableEffect(
-        (signal) => subscription.addEventListener('channel:message', ({ detail }) => handler(detail), { signal }),
+        (signal) => subscription.addEventListener<M>('channel:message', ({ detail }) => handler(detail), { signal }),
         [subscription, ...deps], // Not including `handler`, as its dependencies should already be in `deps`
     );
 }
@@ -94,21 +94,21 @@ export function useChannelMessages<M>(
  * If the channel is unavailable, this hook behaves like a standard useState.
  */
 export function useChannelState<S>(
-    subscription: SubscriptionHandle<any, S>,
+    subscription: SubscriptionHandle,
     initialState: (S extends Function ? never : S) | (() => S),
 ): [S, SetState<S>] {
     // Start with either the value already known by the subscription, or the given initial value.
     const [state, setInner] = useState<S>(() => {
-        return subscription.state.orElse(
-            typeof initialState === 'function'
-                ? (initialState as () => S) // Assume any function is a factory function
-                : () => initialState
-        );
+        //return subscription.state.orElse(
+        return (typeof initialState === 'function'
+            ? (initialState as () => S) // Assume any function is a factory function
+            : () => initialState)();
+        // );
     });
 
     // Ensure that `setState` is stable if nothing else changes.
-    const setState = useCallback<SetState<S>>((value) => subscription.setState(value), [subscription]);
-
+    const setState = useCallback<SetState<S>>((value) => { /* subscription.setState(value) */ }, [subscription]);
+/*
     useAbortableEffect(
         (signal) => {
             // If the channel has a defined state, we use it as the hook state.
@@ -128,7 +128,7 @@ export function useChannelState<S>(
         },
         [subscription]
     );
-
+*/
     return [state, setState];
 }
 
@@ -139,9 +139,9 @@ type SetState<S> = (value: (S extends Function ? never : S) | ((prev: S | undefi
  * subscription.
  */
 export function useChannelPresence<P extends string>(
-    subscription: SubscriptionHandle<any, any>
+    subscription: SubscriptionHandle
 ): P[] {
-    const [presence, setPresence] = useState<P[]>((() => subscription.presence as P[]));
+    /*const [presence, setPresence] = useState<P[]>((() => subscription.presence as P[]));
 
     useAbortableEffect(
         (signal) => {
@@ -151,5 +151,6 @@ export function useChannelPresence<P extends string>(
         [subscription]
     );
 
-    return presence;
+    return presence;*/
+    return [];
 }

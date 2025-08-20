@@ -7,7 +7,6 @@
  */
 export class HedwigToken {
   readonly raw: string
-  readonly user: string
   readonly channel: string
   readonly tokenLifetime: number
   readonly tokenExpiration: number
@@ -17,7 +16,7 @@ export class HedwigToken {
   constructor(token: string) {
     this.raw = token
 
-    const [payloadBase64 /* signature */] = token.split('.')
+    const [/*app */, payloadBase64, /* signature */] = token.split('.')
     // We ignore the signature part as it is not needed for the client-side
     // logic. It is assumed to be correct and will be forwarded as-is.
 
@@ -40,8 +39,6 @@ export class HedwigToken {
     if (
       payload &&
       typeof payload === 'object' &&
-      'u' in payload &&
-      typeof payload.u === 'string' && // User
       'c' in payload &&
       typeof payload.c === 'string' && // Channel
       'e' in payload &&
@@ -49,7 +46,6 @@ export class HedwigToken {
       'l' in payload &&
       typeof payload.l === 'number' // Lifetime (seconds)
     ) {
-      this.user = payload.u
       this.channel = payload.c
 
       // To avoid clock skew, use the local time to compute expiration instants
