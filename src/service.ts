@@ -84,6 +84,11 @@ export class Service extends EventEmitter {
         return this.#socket !== null && this.#socket.readyState === WebSocket.OPEN;
     }
 
+    /** Returns the channel for the given subscription. */
+    getChannel(sub: Subscription): Channel | undefined {
+        return this.#currentChannel.get(sub);
+    }
+
     /**
      * Returns a promise that will be resolved when the service gets connected.
      *
@@ -364,7 +369,7 @@ export class Service extends EventEmitter {
             if ('channel' in message) {
                 const channel = this.#channels.get(message.channel!);
                 if (channel) {
-                    channel.dispatchToSubscriptions(message.event, message.data);
+                    channel.handleEvent(message.event, message.data);
                 }
             } else {
                 this.dispatchEvent(message.event, message.data);
@@ -417,11 +422,17 @@ class Channel extends EventEmitter {
     /** The set of subscriptions using this channel */
     #subscriptions = new Set<Subscription>();
 
+    /** The set of users currently connected to this channel */
+    #presence: string[] = [];
+
     constructor(
         readonly name: string,
         private readonly service: Service,
     ) {
         super();
+        this.addEventListener('presence:update', ({ detail }: CustomEvent<string[]>) => {
+            this.#presence = detail;
+        });
     }
 
     get isConnected(): boolean {
@@ -437,6 +448,10 @@ class Channel extends EventEmitter {
                 this.dispatchEvent('channel:down', undefined);
             }
         }
+    }
+
+    get presence(): string[] {
+        return this.#presence;
     }
 
     /** @see Service.upPromise() */
@@ -476,7 +491,8 @@ class Channel extends EventEmitter {
         return this.#subscriptions.size > 0;
     }
 
-    dispatchToSubscriptions(event: string, data: unknown) {
+    handleEvent(event: string, data: unknown) {
+        this.dispatchEvent(event, data);
         for (const sub of this.#subscriptions) {
             sub.dispatchEvent(event, data);
         }
@@ -510,6 +526,10 @@ class Subscription extends EventEmitter {
         super();
         this.#logger = service.makeLogger(`S:${this.#subscriptionId}`);
         this.#run(); // Async
+    }
+
+    get channel(): Channel | undefined {
+        return this.service.getChannel(this);
     }
 
     /** The main lifecycle of this subscription, will run until terminated. */
@@ -654,5 +674,10 @@ export class SubscriptionHandle {
             throw new Error('Cannot add event listener to a canceled subscription');
         }
         this.#subscription.addEventListener(type, callback as EventListener, options);
+    }
+
+    /** Returns the presence list for this subscription. */
+    get presence(): string[] {
+        return this.#subscription.channel?.presence ?? [];
     }
 }

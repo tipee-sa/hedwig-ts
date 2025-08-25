@@ -108,27 +108,27 @@ export function useChannelState<S>(
 
     // Ensure that `setState` is stable if nothing else changes.
     const setState = useCallback<SetState<S>>((value) => { /* subscription.setState(value) */ }, [subscription]);
-/*
-    useAbortableEffect(
-        (signal) => {
-            // If the channel has a defined state, we use it as the hook state.
-            // Otherwise, we update the channel state with whatever value we
-            // have in the hook, but taking care to only override an undefined
-            // state, as the value might not yet be loaded.
-            subscription.state.isSome()
-                ? setInner(subscription.state.value)
-                : subscription.setState(() => state, true);
+    /*
+        useAbortableEffect(
+            (signal) => {
+                // If the channel has a defined state, we use it as the hook state.
+                // Otherwise, we update the channel state with whatever value we
+                // have in the hook, but taking care to only override an undefined
+                // state, as the value might not yet be loaded.
+                subscription.state.isSome()
+                    ? setInner(subscription.state.value)
+                    : subscription.setState(() => state, true);
 
-            // Then, we keep the hook in-sync with the channel state.
-            //
-            // Note: that the `channel:state` event is fired even if the socket
-            // is unavailable as Hedwig will keep track of state changes and
-            // reconcile when the socket is reconnected.
-            subscription.addEventListener('channel:state', ({ detail }) => setInner(detail), { signal });
-        },
-        [subscription]
-    );
-*/
+                // Then, we keep the hook in-sync with the channel state.
+                //
+                // Note: that the `channel:state` event is fired even if the socket
+                // is unavailable as Hedwig will keep track of state changes and
+                // reconcile when the socket is reconnected.
+                subscription.addEventListener('channel:state', ({ detail }) => setInner(detail), { signal });
+            },
+            [subscription]
+        );
+    */
     return [state, setState];
 }
 
@@ -141,16 +141,15 @@ type SetState<S> = (value: (S extends Function ? never : S) | ((prev: S | undefi
 export function useChannelPresence<P extends string>(
     subscription: SubscriptionHandle
 ): P[] {
-    /*const [presence, setPresence] = useState<P[]>((() => subscription.presence as P[]));
+    const [presence, setPresence] = useState<P[]>((() => subscription.presence as P[]));
 
     useAbortableEffect(
         (signal) => {
             // Update the presence state when the channel presence changes.
-            subscription.addEventListener('channel:presence', ({ detail }) => setPresence(detail as P[]), { signal });
+            subscription.addEventListener('presence:update', ({ detail }: CustomEvent<string[]>) => setPresence(detail as P[]), { signal });
         },
         [subscription]
     );
 
-    return presence;*/
-    return [];
+    return presence;
 }
