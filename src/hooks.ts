@@ -1,6 +1,7 @@
-import React, { useCallback, useContext, useEffect, useRef, useState } from "react";
+import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Context } from "./context";
 import { Authorizer, SubscriptionHandle } from "./service";
+import { Claims } from "./proto";
 
 /** @internal */
 function useAbortableEffect(
@@ -152,4 +153,52 @@ export function useChannelPresence<P extends string>(
     );
 
     return presence;
+}
+
+export function useChannelClaim<Owner extends string>(
+    subscription: SubscriptionHandle,
+    resource: string,
+): [Owner | null, boolean, ClaimFns] {
+    const owned = useRef<boolean>(false);
+    const [owner, setOwner] = useState<[Owner, boolean] | undefined>(() => {
+        const claims = subscription.claims;
+        const owner = claims.claims[resource];
+        owned.current = owner !== undefined && claims.own.includes(resource);
+        return owner === undefined ? undefined : [owner as Owner, owned.current];
+    });
+
+    useAbortableEffect(
+        (signal) => {
+            subscription.addEventListener('claims:update', ({ detail }: CustomEvent<Claims>) => {
+                const owner = detail.claims[resource];
+                owned.current = owner !== undefined && detail.own.includes(resource);
+                setOwner(owner === undefined ? undefined : [owner as Owner, owned.current]);
+            }, { signal });
+        },
+        [subscription, resource]
+    );
+
+    // On unmount or when the resource changes, release the claim.
+    useEffect(() => {
+        () => {
+            if (owned.current) {
+                subscription.claimRelease(resource);
+                owned.current = false;
+            }
+        }
+    }, [subscription, resource]);
+
+    const fns = useMemo<ClaimFns>(() => {
+        return {
+            acquire: (force?: boolean) => subscription.claimAcquire(resource, force ?? false),
+            release: () => subscription.claimRelease(resource),
+        };
+    }, [subscription, resource]);
+
+    return owner === undefined ? [null, false, fns] : [owner[0], owner[1], fns];
+}
+
+type ClaimFns = {
+    acquire: (force?: boolean) => void;
+    release: () => void;
 }

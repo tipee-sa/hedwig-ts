@@ -1,5 +1,5 @@
 import { HedwigToken } from './token';
-import { ClientMessageMap, ClientOp, ErrorCode, ServerMessage, ServerResultFor } from './proto';
+import { Call, Claims, ClientCalls, ClientMessageMap, ClientOp, ErrorCode, ServerMessage, ServerResultFor } from './proto';
 import { Option, Result, sleep } from './util';
 import { ConsoleLogger, Level, Logger } from './logger';
 import { Operation, StateBuffer, StateSetter, StateSource } from './state';
@@ -425,6 +425,9 @@ class Channel extends EventEmitter {
     /** The set of users currently connected to this channel */
     #presence: string[] = [];
 
+    /** The claims for this channel */
+    #claims: Claims = { claims: {}, own: [] };
+
     constructor(
         readonly name: string,
         private readonly service: Service,
@@ -432,6 +435,9 @@ class Channel extends EventEmitter {
         super();
         this.addEventListener('presence:update', ({ detail }: CustomEvent<string[]>) => {
             this.#presence = detail;
+        });
+        this.addEventListener('claims:update', ({ detail }: CustomEvent<Claims>) => {
+            this.#claims = detail;
         });
     }
 
@@ -496,6 +502,28 @@ class Channel extends EventEmitter {
         for (const sub of this.#subscriptions) {
             sub.dispatchEvent(event, data);
         }
+    }
+
+    call<T, C extends Call>(op: C, data: ClientCalls[C]): Promise<ServerResultFor<ClientOp.Call, T>> {
+        const [feature, call] = op.split(':');
+        return this.service.send(ClientOp.Call, {
+            ...data,
+            channel: this.name,
+            feature,
+            call,
+        });
+    }
+
+    get claims(): Claims {
+        return this.#claims;
+    }
+
+    async claimAcquire(resource: string, force: boolean): Promise<void> {
+        await this.call(Call.ClaimsAcquire, { resource, force });
+    }
+
+    async claimRelease(resource: string): Promise<void> {
+        await this.call(Call.ClaimsRelease, { resource });
     }
 
     /** Closes this channel. */
@@ -646,9 +674,6 @@ class Subscription extends EventEmitter {
 /**
  * A SubscriptionHandle is the public API for a subscription.
  * It is returned by the [`Service.subscribe`] method.
- *
- * @typeParam M - The type of the message payload.
- * @typeParam S - The type of the state payload.
  */
 export class SubscriptionHandle {
     /** The internal subscription state */
@@ -679,5 +704,17 @@ export class SubscriptionHandle {
     /** Returns the presence list for this subscription. */
     get presence(): string[] {
         return this.#subscription.channel?.presence ?? [];
+    }
+
+    get claims(): Claims {
+        return this.#subscription.channel?.claims ?? { claims: {}, own: [] };
+    }
+
+    claimAcquire(resource: string, force: boolean): void {
+        this.#subscription.channel?.claimAcquire(resource, force);
+    }
+
+    claimRelease(resource: string): void {
+        this.#subscription.channel?.claimRelease(resource);
     }
 }
