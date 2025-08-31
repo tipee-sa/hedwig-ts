@@ -1,14 +1,16 @@
-import { HedwigToken } from './token';
-import { Call, Claims, ClientCalls, ClientMessageMap, ClientOp, ErrorCode, ServerMessage, ServerResultFor } from './proto';
-import { Option, Result, sleep } from './util';
+import { Features, HedwigToken } from './token';
+import { Call, Claims, ClientCalls, ClientMessageMap, ClientOp, ErrorCode, ServerEvent, Feature, ServerMessage, ServerResultFor } from './proto';
+import { sleep } from './util';
 import { ConsoleLogger, Level, Logger } from './logger';
-import { Operation, StateBuffer, StateSetter, StateSource } from './state';
 
 /** A function that produce a token for a subscription */
 export type Authorizer = (s: AbortSignal) => string | Promise<string>;
 
 /** The value that is thrown whenever attempting to use a disconnected socket or channel */
 const ERR_DISCONNECTED = Symbol('ERR_DISCONNECTED');
+
+/** The value that is returned when no claims are available */
+const NO_CLAIMS: Claims = { claims: {}, own: [] };
 
 /**
  * A ServerError wraps the error code and any additional detail
@@ -54,7 +56,7 @@ export class Service extends EventEmitter {
     readonly #currentChannel = new Map<Subscription, Channel>();
 
     /** The map of pending requests, with their resolvers. */
-    readonly #requests = new Map<number, PromiseWithResolvers<Result<any, ServerError<any, any>>>>();
+    readonly #requests = new Map<number, PromiseWithResolvers<ServerResultFor<ClientOp, any>>>();
 
     /** The underlying WebSocket used to communicate with the backend */
     #socket: WebSocket | null = null;
@@ -100,7 +102,7 @@ export class Service extends EventEmitter {
             return Promise.resolve();
         } else {
             return new Promise(resolve => {
-                this.addEventListener('socket:up', () => resolve(), { once: true, signal });
+                this.addEventListener(ServerEvent.SocketUp, () => resolve(), { once: true, signal });
             });
         }
     }
@@ -118,7 +120,7 @@ export class Service extends EventEmitter {
             return AbortSignal.abort(ERR_DISCONNECTED);
         } else {
             const controller = new AbortController();
-            this.addEventListener('socket:down', () => controller.abort(), { once: true, signal });
+            this.addEventListener(ServerEvent.SocketDown, () => controller.abort(), { once: true, signal });
             return controller.signal;
         }
     }
@@ -203,6 +205,7 @@ export class Service extends EventEmitter {
             }
 
             const channel = this.#channels.get(name)!;
+            channel.features = token.features;
 
             // If this subscription is not already in the channel, add it
             if (!oldChannel || oldChannel.name !== name) {
@@ -297,7 +300,7 @@ export class Service extends EventEmitter {
      * Sends a message to the server and returns a promise that resolves to the
      * server's response.
      */
-    send<T, O extends ClientOp>(op: O, data: ClientMessageMap[O]): Promise<ServerResultFor<O, T>> {
+    send<O extends ClientOp, T extends Call>(op: O, data: ClientMessageMap[O]): Promise<ServerResultFor<O, T>> {
         if (!this.#socket || this.#socket.readyState !== WebSocket.OPEN) {
             return Promise.reject(ERR_DISCONNECTED);
         }
@@ -360,9 +363,9 @@ export class Service extends EventEmitter {
                 this.#requests.delete(message.res);
                 if ('error' in message) {
                     const { error, details } = message;
-                    resolver.resolve(Result.err(new ServerError(error, details)));
+                    resolver.reject(new ServerError(error, details));
                 } else {
-                    resolver.resolve(Result.ok(message.data));
+                    resolver.resolve(message.data);
                 }
             }
         } else if ('event' in message) {
@@ -422,42 +425,47 @@ class Channel extends EventEmitter {
     /** The set of subscriptions using this channel */
     #subscriptions = new Set<Subscription>();
 
-    /** The set of users currently connected to this channel */
-    #presence: string[] = [];
-
-    /** The claims for this channel */
-    #claims: Claims = { claims: {}, own: [] };
+    /** The features of this channel */
+    features: Features = {};
 
     constructor(
         readonly name: string,
         private readonly service: Service,
     ) {
         super();
-        this.addEventListener('presence:update', ({ detail }: CustomEvent<string[]>) => {
+
+        // Keep a local copy of the presence if subscriptions are added later.
+        this.addEventListener(ServerEvent.ChannelPresence, ({ detail }: CustomEvent<string[]>) => {
             this.#presence = detail;
         });
-        this.addEventListener('claims:update', ({ detail }: CustomEvent<Claims>) => {
+
+        // Keep a local copy of the claims if subscriptions are added later.
+        this.addEventListener(ServerEvent.ChannelClaims, ({ detail }: CustomEvent<Claims>) => {
             this.#claims = detail;
+        });
+
+        // When the channel is disconnected, reset the presence and claims.
+        this.addEventListener(ServerEvent.ChannelDown, () => {
+            this.handleEvent(ServerEvent.ChannelPresence, []);
+            this.handleEvent(ServerEvent.ChannelClaims, NO_CLAIMS);
         });
     }
 
+    /** Whether the channel is currently connected. */
     get isConnected(): boolean {
         return this.#isConnected;
     }
 
+    /** Sets the connected state of this channel. */
     set isConnected(value: boolean) {
         if (this.#isConnected !== value) {
             this.#isConnected = value;
             if (value) {
-                this.dispatchEvent('channel:up', undefined);
+                this.handleEvent(ServerEvent.ChannelUp, undefined);
             } else {
-                this.dispatchEvent('channel:down', undefined);
+                this.handleEvent(ServerEvent.ChannelDown, undefined);
             }
         }
-    }
-
-    get presence(): string[] {
-        return this.#presence;
     }
 
     /** @see Service.upPromise() */
@@ -466,7 +474,7 @@ class Channel extends EventEmitter {
             return Promise.resolve();
         } else {
             return new Promise(resolve => {
-                this.addEventListener('channel:up', () => resolve(), { once: true, signal });
+                this.addEventListener(ServerEvent.ChannelUp, () => resolve(), { once: true, signal });
             });
         }
     }
@@ -477,7 +485,7 @@ class Channel extends EventEmitter {
             return AbortSignal.abort(ERR_DISCONNECTED);
         } else {
             const controller = new AbortController();
-            this.addEventListener('channel:down', () => controller.abort(), { once: true, signal });
+            this.addEventListener(ServerEvent.ChannelDown, () => controller.abort(), { once: true, signal });
             return controller.signal;
         }
     }
@@ -497,6 +505,7 @@ class Channel extends EventEmitter {
         return this.#subscriptions.size > 0;
     }
 
+    /** Dispatches an event to this channel and all subscriptions. */
     handleEvent(event: string, data: unknown) {
         this.dispatchEvent(event, data);
         for (const sub of this.#subscriptions) {
@@ -504,31 +513,50 @@ class Channel extends EventEmitter {
         }
     }
 
-    call<T, C extends Call>(op: C, data: ClientCalls[C]): Promise<ServerResultFor<ClientOp.Call, T>> {
+    /** Sends a call to the server and returns a promise that resolves to the server's response. */
+    call<C extends Call>(op: C, data: ClientCalls[C]): Promise<ServerResultFor<ClientOp.Call, C>> {
         const [feature, call] = op.split(':');
         return this.service.send(ClientOp.Call, {
             ...data,
             channel: this.name,
-            feature,
+            feature: feature as Feature,
             call,
         });
-    }
-
-    get claims(): Claims {
-        return this.#claims;
-    }
-
-    async claimAcquire(resource: string, force: boolean): Promise<void> {
-        await this.call(Call.ClaimsAcquire, { resource, force });
-    }
-
-    async claimRelease(resource: string): Promise<void> {
-        await this.call(Call.ClaimsRelease, { resource });
     }
 
     /** Closes this channel. */
     close() {
         this.#abort.abort();
+    }
+
+    /** CLAIMS */
+
+    #claims: Claims = NO_CLAIMS;
+
+    get claims(): Claims {
+        return this.#claims;
+    }
+
+    claimAcquire(resource: string, force: boolean): Promise<boolean> {
+        if (this.isConnected) {
+            return this.call(Call.ClaimsAcquire, { resource, force });
+        }
+        return Promise.resolve(simulate_claim_acquire(this, this.#claims, resource, force, this.features.claims?.user ?? ""));
+    }
+
+    claimRelease(resource: string): Promise<boolean> {
+        if (this.isConnected) {
+            return this.call(Call.ClaimsRelease, { resource });
+        }
+        return Promise.resolve(simulate_claim_release(this, this.#claims, resource));
+    }
+
+    /** PRESENCE */
+
+    #presence: string[] = [];
+
+    get presence(): string[] {
+        return this.#presence;
     }
 }
 
@@ -554,10 +582,20 @@ class Subscription extends EventEmitter {
         super();
         this.#logger = service.makeLogger(`S:${this.#subscriptionId}`);
         this.#run(); // Async
+
+        // Reset the local claims when the channel claims are updated.
+        this.addEventListener(ServerEvent.ChannelClaims, () => {
+            this.#claims = NO_CLAIMS;
+        });
     }
 
+    /** The bound channel, if any */
     get channel(): Channel | undefined {
         return this.service.getChannel(this);
+    }
+
+    get isConnected(): boolean {
+        return this.channel?.isConnected ?? false;
     }
 
     /** The main lifecycle of this subscription, will run until terminated. */
@@ -577,7 +615,7 @@ class Subscription extends EventEmitter {
             // still valid. If it is not valid anymore,, we'll record this
             // as this means the we need to re-fetch a token ASAP.
             let tokenWasForgotten = false;
-            this.service.addEventListener('socket:up', ({ detail: tokens }) => {
+            this.service.addEventListener(ServerEvent.SocketUp, ({ detail: tokens }) => {
                 if (token.isValid) {
                     if (!tokens.has(token.channel)) {
                         tokens.set(token.channel, token);
@@ -669,6 +707,32 @@ class Subscription extends EventEmitter {
         }
         throw new Error('Authorization failed after too many attempts');
     }
+
+    /* CLAIMS */
+
+    #claims: Claims = NO_CLAIMS;
+
+    get claims(): Claims {
+        return this.channel?.claims ?? this.#claims;
+    }
+
+    claimAcquire(resource: string, force: boolean): Promise<boolean> {
+        const channel = this.channel;
+        if (channel) {
+            return channel.claimAcquire(resource, force);
+        } else {
+            return Promise.resolve(simulate_claim_acquire(this, this.#claims, resource, force, ""));
+        }
+    }
+
+    claimRelease(resource: string): Promise<boolean> {
+        const channel = this.channel;
+        if (channel) {
+            return channel.claimRelease(resource);
+        } else {
+            return Promise.resolve(simulate_claim_release(this, this.#claims, resource));
+        }
+    }
 }
 
 /**
@@ -689,6 +753,10 @@ export class SubscriptionHandle {
         return this.#subscription.signal.aborted;
     }
 
+    get isConnected(): boolean {
+        return this.#subscription.isConnected;
+    }
+
     /** Adds an event listener to the subscription. */
     addEventListener<E>(
         type: string,
@@ -701,20 +769,49 @@ export class SubscriptionHandle {
         this.#subscription.addEventListener(type, callback as EventListener, options);
     }
 
-    /** Returns the presence list for this subscription. */
+    /* CLAIMS */
+
+    get claims(): Claims {
+        return this.#subscription.claims;
+    }
+
+    claimAcquire(resource: string, force: boolean): Promise<boolean> {
+        return this.#subscription.claimAcquire(resource, force);
+    }
+
+    claimRelease(resource: string): Promise<boolean> {
+        return this.#subscription.claimRelease(resource);
+    }
+
+    /* PRESENCE */
+
     get presence(): string[] {
         return this.#subscription.channel?.presence ?? [];
     }
+}
 
-    get claims(): Claims {
-        return this.#subscription.channel?.claims ?? { claims: {}, own: [] };
+function simulate_claim_acquire(eventEmitter: EventEmitter, claims: Claims, resource: string, force: boolean, username: string): boolean {
+    if (!force && claims.claims[resource]) {
+        return false;
     }
 
-    claimAcquire(resource: string, force: boolean): void {
-        this.#subscription.channel?.claimAcquire(resource, force);
+    claims.claims[resource] = username;
+    if (!claims.own.includes(resource)) {
+        claims.own.push(resource);
     }
 
-    claimRelease(resource: string): void {
-        this.#subscription.channel?.claimRelease(resource);
+    eventEmitter.dispatchEvent(ServerEvent.ChannelClaims, claims);
+    return true;
+}
+
+function simulate_claim_release(eventEmitter: EventEmitter, claims: Claims, resource: string): boolean {
+    if (!claims.own.includes(resource)) {
+        return false;
     }
+
+    claims.claims[resource] = undefined;
+    claims.own.splice(claims.own.indexOf(resource), 1);
+
+    eventEmitter.dispatchEvent(ServerEvent.ChannelClaims, claims);
+    return true;
 }

@@ -1,7 +1,7 @@
-import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import React, { useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Context } from "./context";
 import { Authorizer, SubscriptionHandle } from "./service";
-import { Claims } from "./proto";
+import { Claims, ServerEvent } from "./proto";
 
 /** @internal */
 function useAbortableEffect(
@@ -60,94 +60,60 @@ export function useChannel(
 }
 
 /**
+ * useChannelStatus returns whether the given subscription is currently connected
+ * to the server.
+ */
+export function useChannelStatus(
+    subscription: SubscriptionHandle,
+): boolean {
+    const [state, setState] = useState<boolean>(() => subscription.isConnected);
+
+    useAbortableEffect(
+        (signal) => {
+            setState(subscription.isConnected);
+            subscription.addEventListener(ServerEvent.ChannelUp, () => setState(subscription.isConnected), { signal });
+            subscription.addEventListener(ServerEvent.ChannelDown, () => setState(subscription.isConnected), { signal });
+        },
+        [subscription]
+    );
+
+    return state;
+}
+
+/**
  * useChannelMessages sets up a listener for messages on the given subscription.
  *
- * It will call the handler with messages received from the channel. The type
- * `M` will be used as the type of the message payload for convenience but
- * can't be verified and might not match the actual message type.
+ * # Offline behavior
  *
- * If the channel is unavailable, this hook does nothing.
+ * When offline, no messages are ever received.
  */
-export function useChannelMessages<M>(
+export function useChannelMessages(
     subscription: SubscriptionHandle,
-    handler: (message: M) => void,
+    handler: (message: unknown) => void,
     deps: React.DependencyList,
 ) {
     useAbortableEffect(
-        (signal) => subscription.addEventListener<M>('channel:message', ({ detail }) => handler(detail), { signal }),
+        (signal) => subscription.addEventListener(ServerEvent.ChannelMessage, ({ detail }) => handler(detail), { signal }),
         [subscription, ...deps], // Not including `handler`, as its dependencies should already be in `deps`
     );
 }
 
 /**
- * useChannelState is a shared variant of a standard useState hook.
+ * useChannelPresence returns the presence set for the channel.
  *
- * Whenever the channel state is updated, every clients connected to the channel
- * will receive the new state. Like the standard hook, the new value can be
- * either:
- *   - a value, in this case it is simply sent to the server and will override
- *     whatever previous value might exist, without any considerations for
- *     possible race conditions; or
- *   - a function that takes the previous value and returns the new value, in
- *     this case concurrent updates are detected and the state update is retried
- *     until it succeeds.
+ * # Offline behavior
  *
- * If the channel is unavailable, this hook behaves like a standard useState.
+ * When offline, the presence set is an empty array.
  */
-export function useChannelState<S>(
-    subscription: SubscriptionHandle,
-    initialState: (S extends Function ? never : S) | (() => S),
-): [S, SetState<S>] {
-    // Start with either the value already known by the subscription, or the given initial value.
-    const [state, setInner] = useState<S>(() => {
-        //return subscription.state.orElse(
-        return (typeof initialState === 'function'
-            ? (initialState as () => S) // Assume any function is a factory function
-            : () => initialState)();
-        // );
-    });
-
-    // Ensure that `setState` is stable if nothing else changes.
-    const setState = useCallback<SetState<S>>((value) => { /* subscription.setState(value) */ }, [subscription]);
-    /*
-        useAbortableEffect(
-            (signal) => {
-                // If the channel has a defined state, we use it as the hook state.
-                // Otherwise, we update the channel state with whatever value we
-                // have in the hook, but taking care to only override an undefined
-                // state, as the value might not yet be loaded.
-                subscription.state.isSome()
-                    ? setInner(subscription.state.value)
-                    : subscription.setState(() => state, true);
-
-                // Then, we keep the hook in-sync with the channel state.
-                //
-                // Note: that the `channel:state` event is fired even if the socket
-                // is unavailable as Hedwig will keep track of state changes and
-                // reconcile when the socket is reconnected.
-                subscription.addEventListener('channel:state', ({ detail }) => setInner(detail), { signal });
-            },
-            [subscription]
-        );
-    */
-    return [state, setState];
-}
-
-type SetState<S> = (value: (S extends Function ? never : S) | ((prev: S | undefined) => S)) => void;
-
-/**
- * useChannelPresence returns the presence set for channel bound to the given
- * subscription.
- */
-export function useChannelPresence<P extends string>(
+export function useChannelPresence(
     subscription: SubscriptionHandle
-): P[] {
-    const [presence, setPresence] = useState<P[]>((() => subscription.presence as P[]));
+): string[] {
+    const [presence, setPresence] = useState<string[]>((() => subscription.presence));
 
     useAbortableEffect(
         (signal) => {
-            // Update the presence state when the channel presence changes.
-            subscription.addEventListener('presence:update', ({ detail }: CustomEvent<string[]>) => setPresence(detail as P[]), { signal });
+            setPresence(subscription.presence);
+            subscription.addEventListener<string[]>(ServerEvent.ChannelPresence, ({ detail }) => setPresence(detail), { signal });
         },
         [subscription]
     );
@@ -155,24 +121,52 @@ export function useChannelPresence<P extends string>(
     return presence;
 }
 
-export function useChannelClaim<Owner extends string>(
+/**
+ * useChannelClaim returns the owner of the given resource as well as a handle
+ * used to acquire and release the claim.
+ *
+ * The retuned values are `[owner, owned, handle]`.
+ *
+ * - `owner` is the current owner of the resource (might by null). It usually
+ *   matches whatever user identifier was defined by the server issuing the
+ *   token, but might be an empty string when offline (see below).
+ *
+ * - `owned` is true if and only if the current socket owns the claim. It is
+ *   possible for `owner` to match the current owner but `owned` to be false
+ *   if multiple sockets are active for the same user.
+ *
+ * - `handle` is the object used to acquire and release the claim.
+ *
+ * The claim is automatically released when the hook arguments are updated or
+ * when the hook is unmounted.
+ *
+ * # Offline behavior
+ *
+ * If Hedwig is unavailable, `claim.acquire` and `claim.release` will emulate
+ * the claim logic locally. In this case, the returned owner might be an empty
+ * string instead of a valid identifier.
+ */
+export function useChannelClaim(
     subscription: SubscriptionHandle,
     resource: string,
-): [Owner | null, boolean, ClaimFns] {
+): [string | null, boolean, ClaimHandle] {
+    // Whether the hook owns the claim. If true, the claim will be automatically
+    // released when the hook arguments are updated or when the hook is unmounted.
     const owned = useRef<boolean>(false);
-    const [owner, setOwner] = useState<[Owner, boolean] | undefined>(() => {
+
+    const [owner, setOwner] = useState<[string, boolean] | undefined>(() => {
         const claims = subscription.claims;
         const owner = claims.claims[resource];
         owned.current = owner !== undefined && claims.own.includes(resource);
-        return owner === undefined ? undefined : [owner as Owner, owned.current];
+        return owner === undefined ? undefined : [owner, owned.current];
     });
 
     useAbortableEffect(
         (signal) => {
-            subscription.addEventListener('claims:update', ({ detail }: CustomEvent<Claims>) => {
+            subscription.addEventListener<Claims>(ServerEvent.ChannelClaims, ({ detail }) => {
                 const owner = detail.claims[resource];
                 owned.current = owner !== undefined && detail.own.includes(resource);
-                setOwner(owner === undefined ? undefined : [owner as Owner, owned.current]);
+                setOwner(owner === undefined ? undefined : [owner, owned.current]);
             }, { signal });
         },
         [subscription, resource]
@@ -180,25 +174,39 @@ export function useChannelClaim<Owner extends string>(
 
     // On unmount or when the resource changes, release the claim.
     useEffect(() => {
-        () => {
-            if (owned.current) {
-                subscription.claimRelease(resource);
-                owned.current = false;
-            }
-        }
+        return () => {
+            owned.current && subscription.claimRelease(resource);
+            owned.current = false;
+        };
     }, [subscription, resource]);
 
-    const fns = useMemo<ClaimFns>(() => {
+    const handle = useMemo<ClaimHandle>(() => {
         return {
             acquire: (force?: boolean) => subscription.claimAcquire(resource, force ?? false),
             release: () => subscription.claimRelease(resource),
         };
     }, [subscription, resource]);
 
-    return owner === undefined ? [null, false, fns] : [owner[0], owner[1], fns];
+    return owner === undefined ? [null, false, handle] : [owner[0], owner[1], handle];
 }
 
-type ClaimFns = {
-    acquire: (force?: boolean) => void;
-    release: () => void;
+/**
+ * ClaimHandle allows to acquire and release the claim for the resource.
+ */
+type ClaimHandle = {
+    /**
+     * Acquires an exclusive claim for the resource. If `force` is true, the
+     * claim succeeds even if the resource is already claimed.
+     *
+     * Returns whether the claim was acquired.
+     */
+    acquire: (force?: boolean) => Promise<boolean>;
+
+    /**
+     * Releases your own claim for the resource. If the resource is claimed by
+     * someone else, this does nothing.
+     *
+     * Returns whether the claim was actually released.
+     */
+    release: () => Promise<boolean>;
 }

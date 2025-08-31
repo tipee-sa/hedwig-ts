@@ -1,8 +1,5 @@
 // Client -> Server
 
-import { ServerError } from "./service";
-import { Result } from "./util";
-
 export const enum ClientOp {
     Join = 'join',
     Leave = 'leave',
@@ -12,12 +9,11 @@ export const enum ClientOp {
 export type ClientMessageMap = {
     [ClientOp.Join]: { token: string };
     [ClientOp.Leave]: { channel: string };
-    [ClientOp.Call]: { channel: string, feature: string, call: string };
+    [ClientOp.Call]: { channel: string, feature: Feature, call: string };
 };
 
 export const enum Feature {
     Claims = 'claims',
-    State = 'state',
 }
 
 export const enum Call {
@@ -42,21 +38,40 @@ export type ServerMessage =
 
 export enum ErrorCode {
     Failure = 0,
-    InvalidToken = 1,
-    NotSubscribed = 2,
-    FeatureDisabled = 3,
-    StateWrongRevision = 110,
+    Unsupported = 1,
+    InvalidToken = 2,
+    NotSubscribed = 3,
+    FeatureDisabled = 4,
+}
+
+export const enum ServerEvent {
+    ChannelMessage = 'channel:message',
+    ChannelClaims = 'channel:claims',
+    ChannelPresence = 'channel:presence',
+
+    // Local only
+    SocketUp = 'socket:up',
+    SocketDown = 'socket:down',
+    ChannelUp = 'channel:up',
+    ChannelDown = 'channel:down',
 }
 
 // Request -> Response mapping
 
-export type ServerResultFor<O extends ClientOp, T> = ServerResultMap<T>[O];
+export type ServerResultFor<O extends ClientOp, T extends Call> = ServerResultMap<T>[O];
 
-export type ServerResultMap<T> = {
-    [ClientOp.Join]: Result<void, ServerError<ErrorCode, unknown>>;
-    [ClientOp.Leave]: Result<void, ServerError<ErrorCode, unknown>>;
-    [ClientOp.Call]: Result<unknown, ServerError<ErrorCode, unknown>>;
+export type ServerResultMap<C extends Call> = {
+    [ClientOp.Join]: void;
+    [ClientOp.Leave]: void;
+    [ClientOp.Call]: CallResultMap[C];
 };
+
+export type CallResultMap = {
+    [Call.ClaimsAcquire]: boolean;
+    [Call.ClaimsRelease]: boolean;
+};
+
+// Miscellaneous types
 
 export type Claims = {
     claims: { [resource: string]: string | undefined; };
