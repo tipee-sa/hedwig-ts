@@ -1,8 +1,7 @@
-import { HedwigToken } from './token';
-import { ClientMessageMap, ClientOp, ErrorCode, ServerMessage, ServerOp, ServerResultFor, ServerResultType } from './proto';
-import { Option, Result, sleep } from './util';
+import { Features, HedwigToken } from './token';
+import { Call, Claims, ClientCalls, ClientMessageMap, ClientOp, ErrorCode, ServerEvent, Feature, ServerMessage, ServerResultFor, ErrorCodeName } from './proto';
+import { sleep } from './util';
 import { ConsoleLogger, Level, Logger } from './logger';
-import { Operation, StateBuffer, StateSetter, StateSource } from './state';
 
 /** A function that produce a token for a subscription */
 export type Authorizer = (s: AbortSignal) => string | Promise<string>;
@@ -10,53 +9,29 @@ export type Authorizer = (s: AbortSignal) => string | Promise<string>;
 /** The value that is thrown whenever attempting to use a disconnected socket or channel */
 const ERR_DISCONNECTED = Symbol('ERR_DISCONNECTED');
 
+/** The value that is returned when no claims are available */
+const NO_CLAIMS: Claims = { claims: {}, own: [] };
+
 /**
- * A ServerError wraps the error code, message, and any additional detail
+ * A ServerError wraps the error code and any additional detail
  * returned by the server when an operation fails.
  */
 export class ServerError<C extends ErrorCode, T> extends Error {
-    constructor(readonly code: C, readonly message: string, readonly detail: T) {
-        super(`[E${code}] ${message}`);
+    constructor(readonly code: C, readonly detail: T) {
+        super(`[E${code}] ${ErrorCodeName.get(code) ?? 'Unknown'}`);
         this.name = this.constructor.name;
     }
 }
 
-/**
- * An abstract, type-safe, event emitter. `EventMap` must be a mapping of
- * event names to their payload types.
- */
-abstract class EventEmitter<EventMap> {
-    /**
-     * The underlying event target used to manage listeners and dispatch events.
-     * Its methods are wrapped by the `EventEmitter` to provide a type-safe API.
-     */
+export abstract class EventEmitter {
     #eventTarget: EventTarget = new EventTarget();
 
-    /** Adds an event listener to this emitter. */
-    addEventListener<K extends keyof EventMap & string>(
-        type: K,
-        callback: (ev: CustomEvent<EventMap[K]>) => void,
-        options?: AddEventListenerOptions
-    ): void {
+    dispatchEvent(event: string, detail: unknown): boolean {
+        return this.#eventTarget.dispatchEvent(new CustomEvent(event, { detail }));
+    }
+
+    addEventListener(type: string, callback: (e: CustomEvent) => void, options?: AddEventListenerOptions): void {
         this.#eventTarget.addEventListener(type, callback as EventListener, options);
-    }
-
-    /** Removes an event listener from this emitter. */
-    removeEventListener<K extends keyof EventMap & string>(
-        type: K,
-        callback: (ev: CustomEvent<EventMap[K]>) => void,
-        options?: EventListenerOptions
-    ): void {
-        this.#eventTarget.removeEventListener(type, callback as EventListener, options);
-    }
-
-    /** Dispatches an event from this emitter. */
-    dispatchEvent<K extends keyof EventMap & string>(
-        type: K,
-        detail: EventMap[K],
-        cancelable: boolean = false
-    ): boolean {
-        return this.#eventTarget.dispatchEvent(new CustomEvent(type, { detail, cancelable }));
     }
 }
 
@@ -66,10 +41,7 @@ abstract class EventEmitter<EventMap> {
  * subscriptions, and share resources if multiple subscriptions are using the
  * same channel.
  */
-export class Service extends EventEmitter<{
-    'socket:up': Map<string, HedwigToken>;
-    'socket:down': CloseEvent;
-}> {
+export class Service extends EventEmitter {
     /** The logger instance */
     readonly #logger: Logger;
 
@@ -83,7 +55,7 @@ export class Service extends EventEmitter<{
     readonly #currentChannel = new Map<Subscription, Channel>();
 
     /** The map of pending requests, with their resolvers. */
-    readonly #requests = new Map<number, PromiseWithResolvers<Result<any, ServerError<any, any>>>>();
+    readonly #requests = new Map<number, PromiseWithResolvers<ServerResultFor<ClientOp, any>>>();
 
     /** The underlying WebSocket used to communicate with the backend */
     #socket: WebSocket | null = null;
@@ -113,6 +85,11 @@ export class Service extends EventEmitter<{
         return this.#socket !== null && this.#socket.readyState === WebSocket.OPEN;
     }
 
+    /** Returns the channel for the given subscription. */
+    getChannel(sub: Subscription): Channel | undefined {
+        return this.#currentChannel.get(sub);
+    }
+
     /**
      * Returns a promise that will be resolved when the service gets connected.
      *
@@ -124,7 +101,7 @@ export class Service extends EventEmitter<{
             return Promise.resolve();
         } else {
             return new Promise(resolve => {
-                this.addEventListener('socket:up', () => resolve(), { once: true, signal });
+                this.addEventListener(ServerEvent.SocketUp, () => resolve(), { once: true, signal });
             });
         }
     }
@@ -142,7 +119,7 @@ export class Service extends EventEmitter<{
             return AbortSignal.abort(ERR_DISCONNECTED);
         } else {
             const controller = new AbortController();
-            this.addEventListener('socket:down', () => controller.abort(), { once: true, signal });
+            this.addEventListener(ServerEvent.SocketDown, () => controller.abort(), { once: true, signal });
             return controller.signal;
         }
     }
@@ -154,11 +131,8 @@ export class Service extends EventEmitter<{
      * the authorizer function is still called for each subscription to account
      * for possible channel change from the backend. Known multiple uses of the
      * same channel should instead share a single subscription.
-     *
-     * @typeParam M - The type of the message payload.
-     * @typeParam S - The type of the state payload.
      */
-    subscribe<M, S>(signal: AbortSignal, authorizer: Authorizer): SubscriptionHandle<M, S> {
+    subscribe(signal: AbortSignal, authorizer: Authorizer): SubscriptionHandle {
         if (this.#terminated) {
             throw new Error('Service has been terminated');
         }
@@ -169,7 +143,7 @@ export class Service extends EventEmitter<{
             this.#gracefulDisconnectTimer = null;
         }
 
-        const subscription = new Subscription<M, S>(this, signal, authorizer);
+        const subscription = new Subscription(this, signal, authorizer);
         this.#subscriptions.add(subscription);
         this.#connect();
 
@@ -204,7 +178,7 @@ export class Service extends EventEmitter<{
                 oldChannel.close();
                 this.#channels.delete(oldChannel.name);
                 if (this.isConnected) {
-                    this.send({ [ClientOp.Leave]: [oldChannel.name] }).catch((err) => {
+                    this.send(ClientOp.Leave, { channel: oldChannel.name }).catch((err) => {
                         // Ignore disconnect errors when leaving.
                         if (err !== ERR_DISCONNECTED) {
                             throw err;
@@ -227,6 +201,7 @@ export class Service extends EventEmitter<{
             }
 
             const channel = this.#channels.get(name)!;
+            channel.features = token.features;
 
             // If this subscription is not already in the channel, add it
             if (!oldChannel || oldChannel.name !== name) {
@@ -237,7 +212,7 @@ export class Service extends EventEmitter<{
             // Send the token to either join or renew the subscription
             if (this.isConnected) {
                 try {
-                    await this.send({ [ClientOp.Join]: [token.raw] });
+                    await this.send(ClientOp.Join, { token: token.raw });
                     channel.isConnected = true;
                 } catch (err) {
                     if (err !== ERR_DISCONNECTED) {
@@ -321,13 +296,13 @@ export class Service extends EventEmitter<{
      * Sends a message to the server and returns a promise that resolves to the
      * server's response.
      */
-    send<T, O extends ClientOp>(message: ClientMessageMap[O]): Promise<ServerResultFor<O, T>> {
+    send<O extends ClientOp, T extends Call>(op: O, data: ClientMessageMap[O]): Promise<ServerResultFor<O, T>> {
         if (!this.#socket || this.#socket.readyState !== WebSocket.OPEN) {
             return Promise.reject(ERR_DISCONNECTED);
         }
 
         const oid = ++this.#nextOID;
-        const serialized = JSON.stringify([oid, message]);
+        const serialized = JSON.stringify({ id: oid, op, ...data });
 
         this.#socket.send(serialized);
 
@@ -354,18 +329,15 @@ export class Service extends EventEmitter<{
         this.dispatchEvent('socket:up', channelToRejoin);
         // Subscriptions will populate the channelToRejoin map with tokens.
 
-        const tokens = Array.from(channelToRejoin.values()).map(t => t.raw);
-        if (tokens.length > 0) {
-            // This must be the first message sent once the connection is ready
-            // to match the bootstrap protocol.
+        if (channelToRejoin.size > 0) {
             try {
-                await this.send({ [ClientOp.Join]: tokens });
-                for (const name of channelToRejoin.keys()) {
+                await Promise.all(Array.from(channelToRejoin.entries()).map(async ([name, token]) => {
+                    await this.send(ClientOp.Join, { token: token.raw });
                     const channel = this.#channels.get(name);
                     if (channel) {
                         channel.isConnected = true;
                     }
-                }
+                }));
             } catch (err) {
                 if (err !== ERR_DISCONNECTED) {
                     throw err;
@@ -376,61 +348,24 @@ export class Service extends EventEmitter<{
 
     readonly #onMessage = (e: MessageEvent) => {
         const message = JSON.parse(e.data) as ServerMessage;
-        switch (true) {
-            case ServerOp.Message in message: {
-                const [channelName, payload] = message[ServerOp.Message];
-                const channel = this.#channels.get(channelName);
-                if (channel) {
-                    channel.dispatchMessage(payload);
+        if ('res' in message) {
+            const resolver = this.#requests.get(message.res);
+            if (resolver) {
+                this.#requests.delete(message.res);
+                if ('error' in message) {
+                    const { error, details } = message;
+                    resolver.reject(new ServerError(error, details));
+                } else {
+                    resolver.resolve(message.data);
                 }
-                return;
             }
-
-            case ServerOp.State in message: {
-                const [channelName, [state, revision]] = message[ServerOp.State];
-                const channel = this.#channels.get(channelName);
-                if (channel) {
-                    channel.dispatchState(state, revision);
-                }
-                return;
+        } else if ('event' in message) {
+            const channel = this.#channels.get(message.channel!);
+            if (channel) {
+                channel.handleEvent(message.event, message.data);
             }
-
-            case ServerOp.Presence in message: {
-                const [channelName, presence] = message[ServerOp.Presence];
-                const channel = this.#channels.get(channelName);
-                if (channel) {
-                    channel.dispatchPresence(presence);
-                }
-                return;
-            }
-
-            case ServerOp.Response in message: {
-                const [oid, result] = message[ServerOp.Response];
-                const resolver = this.#requests.get(oid);
-                if (resolver) {
-                    this.#requests.delete(oid);
-                    if (!result) {
-                        resolver.resolve(Result.ok(undefined)); // No result, resolve with undefined
-                    } else if (ServerResultType.Success in result) {
-                        resolver.resolve(Result.ok(result[ServerResultType.Success]));
-                    } else if (ServerResultType.Error in result) {
-                        const [code, message, detail] = result[ServerResultType.Error];
-                        resolver.resolve(Result.err(new ServerError(code, message, detail)));
-                    } else {
-                        this.#logger.error('Invalid server response:', result);
-                        resolver.reject(new Error('Invalid server response'));
-                    }
-                }
-                return;
-            }
-
-            case ServerOp.ChannelClosed in message: {
-                throw new Error('NYI: Channel closed notifications are not yet implemented');
-                return;
-            }
-
-            default:
-                this.#logger.warn('Unhandled message:', message);
+        } else {
+            this.#logger.warn('Unhandled message:', message);
         }
     }
 
@@ -446,7 +381,6 @@ export class Service extends EventEmitter<{
 
         for (const channel of this.#channels.values()) {
             channel.isConnected = false;
-            channel.dispatchPresence([]); // Clear presence on disconnect
         }
 
         // Cancel all outgoing requests
@@ -468,10 +402,7 @@ export class Service extends EventEmitter<{
  * A Channel is a single Hedwig channel. A single instance is shared by all
  * subscriptions that use the same channel name.
  */
-class Channel<M = any, S = any> extends EventEmitter<{
-    'channel:up': void;
-    'channel:down': void;
-}> {
+class Channel extends EventEmitter {
     /** The abort controller used to cancel operations on this channel on close */
     #abort = new AbortController();
 
@@ -479,37 +410,47 @@ class Channel<M = any, S = any> extends EventEmitter<{
     #isConnected = false;
 
     /** The set of subscriptions using this channel */
-    #subscriptions = new Set<Subscription<M, S>>();
+    #subscriptions = new Set<Subscription>();
 
-    /** The state buffer for this channel */
-    #stateBuffer = new StateBuffer<S>();
-
-    /** The upstream for the state buffer, used to implement the actual state synchronization */
-    #stateSource: StateSource<S>;
-
-    /** The presence set for this channel */
-    #presence: string[] = [];
+    /** The features of this channel */
+    features: Features = {};
 
     constructor(
         readonly name: string,
         private readonly service: Service,
     ) {
         super();
-        this.#stateSource = new ChannelState(this, this.#abort.signal, this.service);
-        this.#stateBuffer.upstream = this.#stateSource;
+
+        // Keep a local copy of the presence if subscriptions are added later.
+        this.addEventListener(ServerEvent.ChannelPresence, ({ detail }: CustomEvent<string[]>) => {
+            this.#presence = detail;
+        });
+
+        // Keep a local copy of the claims if subscriptions are added later.
+        this.addEventListener(ServerEvent.ChannelClaims, ({ detail }: CustomEvent<Claims>) => {
+            this.#claims = detail;
+        });
+
+        // When the channel is disconnected, reset the presence and claims.
+        this.addEventListener(ServerEvent.ChannelDown, () => {
+            this.handleEvent(ServerEvent.ChannelPresence, []);
+            this.handleEvent(ServerEvent.ChannelClaims, NO_CLAIMS);
+        });
     }
 
+    /** Whether the channel is currently connected. */
     get isConnected(): boolean {
         return this.#isConnected;
     }
 
+    /** Sets the connected state of this channel. */
     set isConnected(value: boolean) {
         if (this.#isConnected !== value) {
             this.#isConnected = value;
             if (value) {
-                this.dispatchEvent('channel:up', undefined);
+                this.handleEvent(ServerEvent.ChannelUp, undefined);
             } else {
-                this.dispatchEvent('channel:down', undefined);
+                this.handleEvent(ServerEvent.ChannelDown, undefined);
             }
         }
     }
@@ -520,7 +461,7 @@ class Channel<M = any, S = any> extends EventEmitter<{
             return Promise.resolve();
         } else {
             return new Promise(resolve => {
-                this.addEventListener('channel:up', () => resolve(), { once: true, signal });
+                this.addEventListener(ServerEvent.ChannelUp, () => resolve(), { once: true, signal });
             });
         }
     }
@@ -531,20 +472,18 @@ class Channel<M = any, S = any> extends EventEmitter<{
             return AbortSignal.abort(ERR_DISCONNECTED);
         } else {
             const controller = new AbortController();
-            this.addEventListener('channel:down', () => controller.abort(), { once: true, signal });
+            this.addEventListener(ServerEvent.ChannelDown, () => controller.abort(), { once: true, signal });
             return controller.signal;
         }
     }
 
     /** Adds a subscription to this channel. */
-    addSubscription(sub: Subscription<M, S>) {
+    addSubscription(sub: Subscription) {
         this.#subscriptions.add(sub);
-        sub.stateUpstream = this.#stateBuffer;
-        sub.dispatchEvent('channel:presence', this.#presence);
     }
 
     /** Removes a subscription from this channel. */
-    removeSubscription(sub: Subscription<M, S>): boolean {
+    removeSubscription(sub: Subscription): boolean {
         return this.#subscriptions.delete(sub);
     }
 
@@ -553,109 +492,67 @@ class Channel<M = any, S = any> extends EventEmitter<{
         return this.#subscriptions.size > 0;
     }
 
-    /** Dispatches a message from the server. */
-    dispatchMessage(message: M): void {
+    /** Dispatches an event to this channel and all subscriptions. */
+    handleEvent(event: string, data: unknown) {
+        this.dispatchEvent(event, data);
         for (const sub of this.#subscriptions) {
-            sub.dispatchEvent('channel:message', message);
+            sub.dispatchEvent(event, data);
         }
     }
 
-    /** Dispatches a state update from the server. */
-    dispatchState(state: unknown, revision: string) {
-        this.#stateSource.sync(Option.some(state as S), revision);
-    }
-
-    /** Dispatches a presence update from the server. */
-    dispatchPresence(presence: string[]): void {
-        this.#presence = presence;
-        for (const sub of this.#subscriptions) {
-            sub.dispatchEvent('channel:presence', presence);
-        }
+    /** Sends a call to the server and returns a promise that resolves to the server's response. */
+    call<C extends Call>(op: C, data: ClientCalls[C]): Promise<ServerResultFor<ClientOp.Call, C>> {
+        const [feature, call] = op.split(':');
+        return this.service.send(ClientOp.Call, {
+            ...data,
+            channel: this.name,
+            feature: feature as Feature,
+            call,
+        });
     }
 
     /** Closes this channel. */
     close() {
         this.#abort.abort();
     }
-}
 
-/**
- * A ChannelState is a `StateSource` that implements the actual synchronization
- * logic between the client-side channel state and the server-side state.
- */
-class ChannelState<S> extends StateSource<S> {
-    constructor(
-        private readonly channel: Channel<any, S>,
-        private readonly signal: AbortSignal,
-        private readonly service: Service,
-    ) {
-        super();
+    /** CLAIMS */
+
+    #claims: Claims = NO_CLAIMS;
+
+    get claims(): Claims {
+        return this.#claims;
     }
 
-    protected async processOperations(poll: () => Operation<S> | undefined): Promise<void> {
-        for (let op = poll(); op; op = poll()) {
-            await this.#sendState(op);
+    claimAcquire(resource: string, force: boolean): Promise<boolean> {
+        if (this.isConnected) {
+            return this.call(Call.ClaimsAcquire, { resource, force });
         }
+        return Promise.resolve(simulate_claim_acquire(this, this.#claims, resource, force, this.features.claims?.user ?? ""));
     }
 
-    async #sendState(operation: Operation<S>): Promise<void> {
-        const op = { ...operation }; // Clone the operation to avoid modifying the original
-        while (!this.signal.aborted) {
-            await this.channel.upPromise(this.signal);
-            try {
-                let res = await this.service.send<S, ClientOp.SetState>({
-                    [ClientOp.SetState]: [this.channel.name, op.value, op.revision],
-                });
-                if (res.isErr()) {
-                    const err = res.value;
-                    if (err.code === ErrorCode.WrongRevision) {
-                        if ('v' in err.detail) {
-                            if (op.mode === 'merge' && !op.weak) {
-                                op.value = op.fn(err.detail.v);
-                                op.revision = err.detail.r;
-                                continue;
-                            } else {
-                                // If the operation was a put or a weak-merge, let's drop the change altogether.
-                                return;
-                            }
-                        } else {
-                            // There is no value on the server-side. It usually means that the state was reset.
-                            // We retry using the correct revision for any type of operation.
-                            op.revision = err.detail.r;
-                            continue;
-                        }
-                    }
-                    else {
-                        // Some other error occurred, we should not retry.
-                        throw err;
-                    }
-                }
-                return; // Done
-            }
-            catch (err) {
-                if (err === ERR_DISCONNECTED) {
-                    continue;
-                }
-                console.error('Failed to send state update:', err);
-                return;
-            }
+    claimRelease(resource: string): Promise<boolean> {
+        if (this.isConnected) {
+            return this.call(Call.ClaimsRelease, { resource });
         }
+        return Promise.resolve(simulate_claim_release(this, this.#claims, resource));
+    }
+
+    /** PRESENCE */
+
+    #presence: string[] = [];
+
+    get presence(): string[] {
+        return this.#presence;
     }
 }
-
-/** Events emitted by a `Subscription` */
-type SubscriptionEventMap<M, S> = {
-    'channel:message': M;
-    'channel:state': S;
-    'channel:presence': string[];
-};
 
 /**
  * A Subscription is a single lease on a channel. It maps 1:1 to a `useChannel`
  * hook from the public API, and is responsible for managing the lifetime of
  * the subscription, including renewing the token and handling reconnection.
  */
-class Subscription<M = any, S = any> extends EventEmitter<SubscriptionEventMap<M, S>> {
+class Subscription extends EventEmitter {
     static #nextSubscriptionId = 0;
 
     /** The unique ID of this subscription */
@@ -664,9 +561,6 @@ class Subscription<M = any, S = any> extends EventEmitter<SubscriptionEventMap<M
     /** The logger instance for this subscription */
     readonly #logger: Logger;
 
-    /** The state buffer for this subscription */
-    readonly #stateBuffer = new StateBuffer<S>();
-
     constructor(
         readonly service: Service,
         readonly signal: AbortSignal,
@@ -674,13 +568,21 @@ class Subscription<M = any, S = any> extends EventEmitter<SubscriptionEventMap<M
     ) {
         super();
         this.#logger = service.makeLogger(`S:${this.#subscriptionId}`);
-        this.#stateBuffer.subscribe((state) => state.isSome() && this.dispatchEvent('channel:state', state.value));
         this.#run(); // Async
+
+        // Reset the local claims when the channel claims are updated.
+        this.addEventListener(ServerEvent.ChannelClaims, () => {
+            this.#claims = NO_CLAIMS;
+        });
     }
 
-    /** Updates the upstream for the state buffer for this subscription. */
-    set stateUpstream(upstream: StateBuffer<S> | undefined) {
-        this.#stateBuffer.upstream = upstream;
+    /** The bound channel, if any */
+    get channel(): Channel | undefined {
+        return this.service.getChannel(this);
+    }
+
+    get isConnected(): boolean {
+        return this.channel?.isConnected ?? false;
     }
 
     /** The main lifecycle of this subscription, will run until terminated. */
@@ -700,7 +602,7 @@ class Subscription<M = any, S = any> extends EventEmitter<SubscriptionEventMap<M
             // still valid. If it is not valid anymore,, we'll record this
             // as this means the we need to re-fetch a token ASAP.
             let tokenWasForgotten = false;
-            this.service.addEventListener('socket:up', ({ detail: tokens }) => {
+            this.service.addEventListener(ServerEvent.SocketUp, ({ detail: tokens }) => {
                 if (token.isValid) {
                     if (!tokens.has(token.channel)) {
                         tokens.set(token.channel, token);
@@ -793,29 +695,43 @@ class Subscription<M = any, S = any> extends EventEmitter<SubscriptionEventMap<M
         throw new Error('Authorization failed after too many attempts');
     }
 
-    // State proxying
-    getState(): Option<S> { return this.#stateBuffer.getState(); }
-    setState(setter: StateSetter<S>, weak: boolean): void { this.#stateBuffer.setState(setter, weak); }
+    /* CLAIMS */
 
-    getPresence(): string[] {
-        // Presence is not implemented in this version, return an empty array
-        return [];
+    #claims: Claims = NO_CLAIMS;
+
+    get claims(): Claims {
+        return this.channel?.claims ?? this.#claims;
+    }
+
+    claimAcquire(resource: string, force: boolean): Promise<boolean> {
+        const channel = this.channel;
+        if (channel) {
+            return channel.claimAcquire(resource, force);
+        } else {
+            return Promise.resolve(simulate_claim_acquire(this, this.#claims, resource, force, ""));
+        }
+    }
+
+    claimRelease(resource: string): Promise<boolean> {
+        const channel = this.channel;
+        if (channel) {
+            return channel.claimRelease(resource);
+        } else {
+            return Promise.resolve(simulate_claim_release(this, this.#claims, resource));
+        }
     }
 }
 
 /**
  * A SubscriptionHandle is the public API for a subscription.
  * It is returned by the [`Service.subscribe`] method.
- *
- * @typeParam M - The type of the message payload.
- * @typeParam S - The type of the state payload.
  */
-export class SubscriptionHandle<M, S> {
+export class SubscriptionHandle {
     /** The internal subscription state */
-    #subscription: Subscription<M, S>;
+    #subscription: Subscription;
 
     /** @internal */
-    constructor(subscription: Subscription<M, S>) {
+    constructor(subscription: Subscription) {
         this.#subscription = subscription;
     }
 
@@ -824,10 +740,14 @@ export class SubscriptionHandle<M, S> {
         return this.#subscription.signal.aborted;
     }
 
+    get isConnected(): boolean {
+        return this.#subscription.isConnected;
+    }
+
     /** Adds an event listener to the subscription. */
-    addEventListener<K extends keyof SubscriptionEventMap<M, S>>(
-        type: K,
-        callback: (ev: CustomEvent<SubscriptionEventMap<M, S>[K]>) => void,
+    addEventListener<E>(
+        type: string,
+        callback: (ev: CustomEvent<E>) => void,
         options?: AddEventListenerOptions
     ): void {
         if (this.canceled) {
@@ -836,26 +756,49 @@ export class SubscriptionHandle<M, S> {
         this.#subscription.addEventListener(type, callback as EventListener, options);
     }
 
-    /** Removes an event listener from the subscription. */
-    removeEventListener<K extends keyof SubscriptionEventMap<M, S>>(
-        type: K,
-        callback: (ev: CustomEvent<SubscriptionEventMap<M, S>[K]>) => void,
-        options?: EventListenerOptions
-    ): void {
-        this.#subscription.removeEventListener(type, callback as EventListener, options);
+    /* CLAIMS */
+
+    get claims(): Claims {
+        return this.#subscription.claims;
     }
 
-    /** Gets the current state of the channel. */
-    get state(): Option<S> {
-        return this.#subscription.getState();
+    claimAcquire(resource: string, force: boolean): Promise<boolean> {
+        return this.#subscription.claimAcquire(resource, force);
     }
 
-    /** Updates the state of the channel. */
-    setState(setter: StateSetter<S>, weak: boolean = false): void {
-        this.#subscription.setState(setter, weak);
+    claimRelease(resource: string): Promise<boolean> {
+        return this.#subscription.claimRelease(resource);
     }
+
+    /* PRESENCE */
 
     get presence(): string[] {
-        return this.#subscription.getPresence();
+        return this.#subscription.channel?.presence ?? [];
     }
+}
+
+function simulate_claim_acquire(eventEmitter: EventEmitter, claims: Claims, resource: string, force: boolean, username: string): boolean {
+    if (!force && claims.claims[resource]) {
+        return false;
+    }
+
+    claims.claims[resource] = username;
+    if (!claims.own.includes(resource)) {
+        claims.own.push(resource);
+    }
+
+    eventEmitter.dispatchEvent(ServerEvent.ChannelClaims, claims);
+    return true;
+}
+
+function simulate_claim_release(eventEmitter: EventEmitter, claims: Claims, resource: string): boolean {
+    if (!claims.own.includes(resource)) {
+        return false;
+    }
+
+    delete claims.claims[resource];
+    claims.own.splice(claims.own.indexOf(resource), 1);
+
+    eventEmitter.dispatchEvent(ServerEvent.ChannelClaims, claims);
+    return true;
 }

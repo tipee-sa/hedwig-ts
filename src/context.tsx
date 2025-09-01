@@ -15,6 +15,7 @@ export function HedwigProvider({ url, verbosity, children }: HedwigProviderProps
     if (service.current === null) {
         service.current = new Service(url, verbosity);
     }
+
     // FIXME: Changing any of the props will not reset the service instance.
     // There should never be a reason to change the URL or verbosity anyway...
 
