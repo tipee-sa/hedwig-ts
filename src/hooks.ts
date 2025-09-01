@@ -81,19 +81,19 @@ export function useChannelStatus(
 }
 
 /**
- * useChannelMessages sets up a listener for messages on the given subscription.
+ * useChannelEvent sets up a listener for events on the given subscription.
  *
  * # Offline behavior
  *
- * When offline, no messages are ever received.
+ * When offline, no events are ever received.
  */
-export function useChannelMessages(
+export function useChannelEvent(
     subscription: SubscriptionHandle,
-    handler: (message: unknown) => void,
+    handler: (event: unknown) => void,
     deps: React.DependencyList,
 ) {
     useAbortableEffect(
-        (signal) => subscription.addEventListener(ServerEvent.ChannelMessage, ({ detail }) => handler(detail), { signal }),
+        (signal) => subscription.addEventListener(ServerEvent.ChannelEvent, ({ detail }) => handler(detail), { signal }),
         [subscription, ...deps], // Not including `handler`, as its dependencies should already be in `deps`
     );
 }

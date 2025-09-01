@@ -31,7 +31,7 @@ export type ClientMessage = ClientMessageMap[ClientOp];
 // Server -> Client
 
 export type ServerMessage =
-    | { event: string, channel?: string, data?: unknown }
+    | { event: string, channel: string, data?: unknown }
     | { res: number, data?: unknown }
     | { res: number, error: ErrorCode, details?: unknown }
     ;
@@ -45,7 +45,7 @@ export enum ErrorCode {
 }
 
 export const enum ServerEvent {
-    ChannelMessage = 'channel:message',
+    ChannelEvent = 'channel:event',
     ChannelClaims = 'channel:claims',
     ChannelPresence = 'channel:presence',
 

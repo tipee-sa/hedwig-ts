@@ -132,9 +132,6 @@ export class Service extends EventEmitter {
      * the authorizer function is still called for each subscription to account
      * for possible channel change from the backend. Known multiple uses of the
      * same channel should instead share a single subscription.
-     *
-     * @typeParam M - The type of the message payload.
-     * @typeParam S - The type of the state payload.
      */
     subscribe(signal: AbortSignal, authorizer: Authorizer): SubscriptionHandle {
         if (this.#terminated) {
@@ -369,13 +366,9 @@ export class Service extends EventEmitter {
                 }
             }
         } else if ('event' in message) {
-            if ('channel' in message) {
-                const channel = this.#channels.get(message.channel!);
-                if (channel) {
-                    channel.handleEvent(message.event, message.data);
-                }
-            } else {
-                this.dispatchEvent(message.event, message.data);
+            const channel = this.#channels.get(message.channel!);
+            if (channel) {
+                channel.handleEvent(message.event, message.data);
             }
         } else {
             this.#logger.warn('Unhandled message:', message);
