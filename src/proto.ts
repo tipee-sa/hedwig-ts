@@ -44,6 +44,11 @@ export enum ErrorCode {
     FeatureDisabled = 4,
 }
 
+export const ErrorCodeName = new Map<ErrorCode, string>();
+for (const [name, value] of Object.entries(ErrorCode)) {
+    ErrorCodeName.set(value as ErrorCode, name);
+}
+
 export const enum ServerEvent {
     ChannelEvent = 'channel:event',
     ChannelClaims = 'channel:claims',

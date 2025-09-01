@@ -1,5 +1,5 @@
 import { Features, HedwigToken } from './token';
-import { Call, Claims, ClientCalls, ClientMessageMap, ClientOp, ErrorCode, ServerEvent, Feature, ServerMessage, ServerResultFor } from './proto';
+import { Call, Claims, ClientCalls, ClientMessageMap, ClientOp, ErrorCode, ServerEvent, Feature, ServerMessage, ServerResultFor, ErrorCodeName } from './proto';
 import { sleep } from './util';
 import { ConsoleLogger, Level, Logger } from './logger';
 
@@ -18,8 +18,7 @@ const NO_CLAIMS: Claims = { claims: {}, own: [] };
  */
 export class ServerError<C extends ErrorCode, T> extends Error {
     constructor(readonly code: C, readonly detail: T) {
-        const name = Object.entries(ErrorCode).filter(([_, value]) => value === code).map(([name]) => name)[0] ?? 'Unknown';
-        super(`[E${code}] ${name}`);
+        super(`[E${code}] ${ErrorCodeName.get(code) ?? 'Unknown'}`);
         this.name = this.constructor.name;
     }
 }
@@ -330,20 +329,15 @@ export class Service extends EventEmitter {
         this.dispatchEvent('socket:up', channelToRejoin);
         // Subscriptions will populate the channelToRejoin map with tokens.
 
-        const tokens = Array.from(channelToRejoin.values()).map(t => t.raw);
-        if (tokens.length > 0) {
-            // This must be the first message sent once the connection is ready
-            // to match the bootstrap protocol.
+        if (channelToRejoin.size > 0) {
             try {
-                for (const token of tokens) {
-                    await this.send(ClientOp.Join, { token });
-                }
-                for (const name of channelToRejoin.keys()) {
+                await Promise.all(Array.from(channelToRejoin.entries()).map(async ([name, token]) => {
+                    await this.send(ClientOp.Join, { token: token.raw });
                     const channel = this.#channels.get(name);
                     if (channel) {
                         channel.isConnected = true;
                     }
-                }
+                }));
             } catch (err) {
                 if (err !== ERR_DISCONNECTED) {
                     throw err;
@@ -802,7 +796,7 @@ function simulate_claim_release(eventEmitter: EventEmitter, claims: Claims, reso
         return false;
     }
 
-    claims.claims[resource] = undefined;
+    delete claims.claims[resource];
     claims.own.splice(claims.own.indexOf(resource), 1);
 
     eventEmitter.dispatchEvent(ServerEvent.ChannelClaims, claims);
