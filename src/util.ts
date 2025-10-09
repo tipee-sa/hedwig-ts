@@ -12,11 +12,33 @@ export function abortPromise(signal: AbortSignal): Promise<void> {
 }
 
 export function sleep(delay: number, signal?: AbortSignal): Promise<void> {
-    const { promise, resolve } = Promise.withResolvers<void>();
+    const { promise, resolve } = Promise_withResolvers<void>();
     const timeout = setTimeout(resolve, delay);
 
     return !signal ? promise : Promise.race([
         abortPromise(signal).finally(() => clearTimeout(timeout)),
         promise,
     ]);
+}
+
+
+export type PromiseWithResolvers<T> = {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+};
+
+/**
+ * Polyfill implementation of Promise.withResolvers
+ */
+export function Promise_withResolvers <T>(): PromiseWithResolvers<T> {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+
+  return { promise, resolve, reject };
 }

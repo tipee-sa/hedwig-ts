@@ -1,6 +1,6 @@
 import { Features, HedwigToken } from './token';
 import { Call, Claims, ClientCalls, ClientMessageMap, ClientOp, ErrorCode, ServerEvent, Feature, ServerMessage, ServerResultFor, ErrorCodeName } from './proto';
-import { sleep } from './util';
+import { Promise_withResolvers, PromiseWithResolvers, sleep } from './util';
 import { ConsoleLogger, Level, Logger } from './logger';
 
 /** A function that produce a token for a subscription */
@@ -306,7 +306,7 @@ export class Service extends EventEmitter {
 
         this.#socket.send(serialized);
 
-        const deferred = Promise.withResolvers<ServerResultFor<O, T>>();
+        const deferred = Promise_withResolvers<ServerResultFor<O, T>>();
         this.#requests.set(oid, deferred);
         return deferred.promise;
     }
