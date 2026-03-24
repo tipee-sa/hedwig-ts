@@ -70,6 +70,7 @@ export function useChannelStatus(
 
     useAbortableEffect(
         (signal) => {
+            if (subscription.canceled) return;
             setState(subscription.isConnected);
             subscription.addEventListener(ServerEvent.ChannelUp, () => setState(subscription.isConnected), { signal });
             subscription.addEventListener(ServerEvent.ChannelDown, () => setState(subscription.isConnected), { signal });
@@ -93,7 +94,10 @@ export function useChannelEvent(
     deps: React.DependencyList,
 ) {
     useAbortableEffect(
-        (signal) => subscription.addEventListener(ServerEvent.ChannelEvent, ({ detail }) => handler(detail), { signal }),
+        (signal) => {
+            if (subscription.canceled) return;
+            subscription.addEventListener(ServerEvent.ChannelEvent, ({ detail }) => handler(detail), { signal });
+        },
         [subscription, ...deps], // Not including `handler`, as its dependencies should already be in `deps`
     );
 }
@@ -112,6 +116,7 @@ export function useChannelPresence(
 
     useAbortableEffect(
         (signal) => {
+            if (subscription.canceled) return;
             setPresence(subscription.presence);
             subscription.addEventListener<string[]>(ServerEvent.ChannelPresence, ({ detail }) => setPresence(detail), { signal });
         },
@@ -163,6 +168,7 @@ export function useChannelClaim(
 
     useAbortableEffect(
         (signal) => {
+            if (subscription.canceled) return;
             subscription.addEventListener<Claims>(ServerEvent.ChannelClaims, ({ detail }) => {
                 const owner = detail.claims[resource];
                 owned.current = owner !== undefined && detail.own.includes(resource);
