@@ -2,7 +2,7 @@ import { Features } from '../token';
 import { Call, type Claims, ClientCalls, ClientOp, Feature, ServerEvent, ServerResultFor } from '../proto';
 import { EventEmitter } from './emitter';
 import { ERR_DISCONNECTED } from './errors';
-import { NO_CLAIMS, simulate_claim_acquire, simulate_claim_release } from './claims';
+import { noClaims, simulate_claim_acquire, simulate_claim_release } from './claims';
 import type { Service } from './service';
 import type { Subscription } from './subscription';
 
@@ -43,7 +43,7 @@ export class Channel extends EventEmitter {
         // When the channel is disconnected, reset the presence and claims.
         this.addEventListener(ServerEvent.ChannelDown, () => {
             this.handleEvent(ServerEvent.ChannelPresence, []);
-            this.handleEvent(ServerEvent.ChannelClaims, NO_CLAIMS);
+            this.handleEvent(ServerEvent.ChannelClaims, noClaims());
         });
     }
 
@@ -130,7 +130,7 @@ export class Channel extends EventEmitter {
 
     /** CLAIMS */
 
-    #claims: Claims = NO_CLAIMS;
+    #claims: Claims = noClaims();
 
     get claims(): Claims {
         return this.#claims;

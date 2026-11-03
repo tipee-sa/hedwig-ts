@@ -3,7 +3,7 @@ import { type Claims, ServerEvent } from '../proto';
 import { sleep } from '../util';
 import { Logger } from '../logger';
 import { EventEmitter } from './emitter';
-import { NO_CLAIMS, simulate_claim_acquire, simulate_claim_release } from './claims';
+import { noClaims, simulate_claim_acquire, simulate_claim_release } from './claims';
 import type { Channel } from './channel';
 import type { Service } from './service';
 
@@ -34,9 +34,13 @@ export class Subscription extends EventEmitter {
         this.#logger = service.makeLogger(`S:${this.#subscriptionId}`);
         this.#run(); // Async
 
-        // Reset the local claims when the channel claims are updated.
-        this.addEventListener(ServerEvent.ChannelClaims, () => {
-            this.#localClaims = NO_CLAIMS;
+        // Discard the stand-in claims once the channel delivers real ones. Not
+        // on the events emitted by the local emulation, which carry
+        // `#localClaims` itself and must keep it.
+        this.addEventListener(ServerEvent.ChannelClaims, ({ detail }) => {
+            if (detail !== this.#localClaims) {
+                this.#localClaims = noClaims();
+            }
         });
     }
 
@@ -166,9 +170,10 @@ export class Subscription extends EventEmitter {
      * channel: before its first token tells it which channel it belongs to, or
      * after it was detached. Acquire and release are emulated on it locally,
      * with an empty owner since the user is unknown too; nothing is sent to the
-     * server. Once bound, `claims` reads the channel's state instead.
+     * server. Once bound, `claims` reads the channel's state instead, and
+     * this is discarded on the first claims the channel delivers.
      */
-    #localClaims: Claims = NO_CLAIMS;
+    #localClaims: Claims = noClaims();
 
     get claims(): Claims {
         return this.channel?.claims ?? this.#localClaims;
