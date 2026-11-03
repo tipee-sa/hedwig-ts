@@ -1,5 +1,6 @@
 import { type Claims } from '../proto';
 import { EventEmitter } from './emitter';
+import { noClaims } from './claims';
 import type { Subscription } from './subscription';
 
 /**
@@ -68,7 +69,7 @@ export class SubscriptionHandle {
     /* CLAIMS */
 
     get claims(): Claims {
-        return this.#live?.claims ?? { claims: {}, own: [] };
+        return this.#live?.claims ?? noClaims();
     }
 
     claimAcquire(resource: string, force: boolean): Promise<boolean> {

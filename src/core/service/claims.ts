@@ -1,8 +1,13 @@
 import { type Claims, ServerEvent } from '../proto';
 import { EventEmitter } from './emitter';
 
-/** The value that is returned when no claims are available */
-export const NO_CLAIMS: Claims = { claims: {}, own: [] };
+/**
+ * Returns a new, empty claims state. A new object every time: the emulation
+ * below mutates the state it is given, so no two holders may share one.
+ */
+export function noClaims(): Claims {
+    return { claims: {}, own: [] };
+}
 
 export function simulate_claim_acquire(eventEmitter: EventEmitter, claims: Claims, resource: string, force: boolean, username: string): boolean {
     if (!force && claims.claims[resource]) {
