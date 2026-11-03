@@ -1,5 +1,5 @@
 import { Features, HedwigToken } from './token';
-import { Call, Claims, ClientCalls, ClientMessageMap, ClientOp, ErrorCode, ServerEvent, Feature, ServerMessage, ServerResultFor, ErrorCodeName } from './proto';
+import { Call, type Claims, ClientCalls, ClientMessageMap, ClientOp, ErrorCode, ServerEvent, Feature, ServerMessage, ServerResultFor, ErrorCodeName } from './proto';
 import { abortable, Promise_withResolvers, PromiseWithResolvers, sleep } from './util';
 import { ConsoleLogger, Level, Logger } from './logger';
 
