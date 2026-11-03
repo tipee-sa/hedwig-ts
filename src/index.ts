@@ -9,5 +9,5 @@ export {
     useChannelClaim,
 } from './react/hooks';
 export { Level as Verbosity } from './core/logger';
-export { SubscriptionHandle } from './core/service';
-export type { Authorizer } from './core/service';
+export { SubscriptionHandle } from './core/service/service';
+export type { Authorizer } from './core/service/service';

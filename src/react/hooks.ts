@@ -1,6 +1,6 @@
 import React, { useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Context } from "./context";
-import { Authorizer, SubscriptionHandle } from "../core/service";
+import { Authorizer, SubscriptionHandle } from "../core/service/service";
 import { Claims, ServerEvent } from "../core/proto";
 
 /** @internal */
