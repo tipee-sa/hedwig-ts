@@ -40,7 +40,7 @@ export class Subscription extends EventEmitter {
 
         // Reset the local claims when the channel claims are updated.
         this.addEventListener(ServerEvent.ChannelClaims, () => {
-            this.#claims = NO_CLAIMS;
+            this.#localClaims = NO_CLAIMS;
         });
     }
 
@@ -182,10 +182,17 @@ export class Subscription extends EventEmitter {
 
     /* CLAIMS */
 
-    #claims: Claims = NO_CLAIMS;
+    /**
+     * Stand-in claims, used only while this subscription is not bound to a
+     * channel: before its first token tells it which channel it belongs to, or
+     * after it was detached. Acquire and release are emulated on it locally,
+     * with an empty owner since the user is unknown too; nothing is sent to the
+     * server. Once bound, `claims` reads the channel's state instead.
+     */
+    #localClaims: Claims = NO_CLAIMS;
 
     get claims(): Claims {
-        return this.channel?.claims ?? this.#claims;
+        return this.channel?.claims ?? this.#localClaims;
     }
 
     claimAcquire(resource: string, force: boolean): Promise<boolean> {
@@ -193,7 +200,7 @@ export class Subscription extends EventEmitter {
         if (channel) {
             return channel.claimAcquire(resource, force);
         } else {
-            return Promise.resolve(simulate_claim_acquire(this, this.#claims, resource, force, ""));
+            return Promise.resolve(simulate_claim_acquire(this, this.#localClaims, resource, force, ""));
         }
     }
 
@@ -202,7 +209,7 @@ export class Subscription extends EventEmitter {
         if (channel) {
             return channel.claimRelease(resource);
         } else {
-            return Promise.resolve(simulate_claim_release(this, this.#claims, resource));
+            return Promise.resolve(simulate_claim_release(this, this.#localClaims, resource));
         }
     }
 }
