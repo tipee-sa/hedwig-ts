@@ -1,6 +1,6 @@
 import React, { createContext, useEffect, useRef } from 'react';
-import { Service } from './service';
-import { Level } from './logger';
+import { Service } from '../core/service';
+import { Level } from '../core/logger';
 
 export const Context = createContext<Service | null>(null);
 

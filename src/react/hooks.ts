@@ -1,7 +1,7 @@
 import React, { useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Context } from "./context";
-import { Authorizer, SubscriptionHandle } from "./service";
-import { Claims, ServerEvent } from "./proto";
+import { Authorizer, SubscriptionHandle } from "../core/service";
+import { Claims, ServerEvent } from "../core/proto";
 
 /** @internal */
 function useAbortableEffect(
