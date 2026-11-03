@@ -90,12 +90,6 @@ function parseFeatures(f: unknown): Features {
   return features;
 }
 
-export type Feature =
-  | 'events'
-  | { 'claims': { user: string } }
-  | { 'presence': { user: string } }
-  ;
-
 export type Features = {
   'events'?: {},
   'claims'?: { user: string },

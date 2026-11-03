@@ -1,5 +1,5 @@
 import { Features, HedwigToken } from './token';
-import { Call, Claims, ClientCalls, ClientMessageMap, ClientOp, ErrorCode, ServerEvent, Feature, ServerMessage, ServerResultFor, ErrorCodeName } from './proto';
+import { Call, type Claims, ClientCalls, ClientMessageMap, ClientOp, ErrorCode, ServerEvent, Feature, ServerMessage, ServerResultFor, ErrorCodeName } from './proto';
 import { Promise_withResolvers, PromiseWithResolvers, sleep } from './util';
 import { ConsoleLogger, Level, Logger } from './logger';
 
@@ -93,17 +93,21 @@ export class Service extends EventEmitter {
     /**
      * Returns a promise that will be resolved when the service gets connected.
      *
-     * If `signal` is aborted before the promise resolves, the promise will
-     * never be resolved, but the underlying event listener will be cancelled.
+     * If `signal` is aborted before the promise resolves, the promise is
+     * rejected with the signal's reason, and the underlying event listener is
+     * cancelled.
      */
     upPromise(signal: AbortSignal): Promise<void> {
         if (this.isConnected) {
             return Promise.resolve();
-        } else {
-            return new Promise(resolve => {
-                this.addEventListener(ServerEvent.SocketUp, () => resolve(), { once: true, signal });
-            });
         }
+        return new Promise((resolve, reject) => {
+            if (signal.aborted) {
+                return reject(signal.reason);
+            }
+            this.addEventListener(ServerEvent.SocketUp, () => resolve(), { once: true, signal });
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
     }
 
     /**
@@ -459,11 +463,14 @@ class Channel extends EventEmitter {
     upPromise(signal: AbortSignal): Promise<void> {
         if (this.#isConnected) {
             return Promise.resolve();
-        } else {
-            return new Promise(resolve => {
-                this.addEventListener(ServerEvent.ChannelUp, () => resolve(), { once: true, signal });
-            });
         }
+        return new Promise((resolve, reject) => {
+            if (signal.aborted) {
+                return reject(signal.reason);
+            }
+            this.addEventListener(ServerEvent.ChannelUp, () => resolve(), { once: true, signal });
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
     }
 
     /** @see Service.downSignal() */
