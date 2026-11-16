@@ -74,13 +74,7 @@ export class Service extends EventEmitter {
         if (this.isConnected) {
             return Promise.resolve();
         }
-        return new Promise((resolve, reject) => {
-            if (signal.aborted) {
-                return reject(signal.reason);
-            }
-            this.addEventListener(ServerEvent.SocketUp, () => resolve(), { once: true, signal });
-            signal.addEventListener('abort', () => reject(signal.reason), { once: true });
-        });
+        return this.eventPromise(ServerEvent.SocketUp, signal);
     }
 
     /**

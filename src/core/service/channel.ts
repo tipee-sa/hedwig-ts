@@ -69,13 +69,7 @@ export class Channel extends EventEmitter {
         if (this.#isConnected) {
             return Promise.resolve();
         }
-        return new Promise((resolve, reject) => {
-            if (signal.aborted) {
-                return reject(signal.reason);
-            }
-            this.addEventListener(ServerEvent.ChannelUp, () => resolve(), { once: true, signal });
-            signal.addEventListener('abort', () => reject(signal.reason), { once: true });
-        });
+        return this.eventPromise(ServerEvent.ChannelUp, signal);
     }
 
     /** @see Service.downSignal() */
