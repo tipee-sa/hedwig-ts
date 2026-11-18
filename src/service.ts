@@ -448,6 +448,14 @@ class Channel extends EventEmitter {
     /** Adds a subscription to this channel. */
     addSubscription(sub: Subscription) {
         this.#subscriptions.add(sub);
+
+        // Joining a channel that is already connected changes none of its
+        // state, so no event would tell the new subscription about it.
+        if (this.#isConnected) {
+            sub.dispatchEvent(ServerEvent.ChannelUp, undefined);
+            sub.dispatchEvent(ServerEvent.ChannelPresence, this.#presence);
+            sub.dispatchEvent(ServerEvent.ChannelClaims, this.#claims);
+        }
     }
 
     /** Removes a subscription from this channel. */
