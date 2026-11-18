@@ -72,9 +72,6 @@ export class Service extends EventEmitter {
     /** Timer for scheduling a graceful disconnect when no subscriptions are active */
     #gracefulDisconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-    /** Indicates whether the service has been terminated */
-    #terminated: boolean = false;
-
     constructor(public url: string, verbosity: Level = Level.Essential) {
         super();
         this.#logger = new ConsoleLogger(verbosity).withPrefix('Hedwig');
@@ -141,10 +138,6 @@ export class Service extends EventEmitter {
      * same channel should instead share a single subscription.
      */
     subscribe(handle: SubscriptionHandle, signal: AbortSignal, authorizer: Authorizer): void {
-        if (this.#terminated) {
-            throw new Error('Service has been terminated');
-        }
-
         // If a graceful disconnect was scheduled, cancel it
         if (this.#gracefulDisconnectTimer !== null) {
             clearTimeout(this.#gracefulDisconnectTimer);
@@ -252,19 +245,6 @@ export class Service extends EventEmitter {
     }
 
     /**
-     * Terminates the service, closing the WebSocket connection and channels.
-     */
-    terminate() {
-        this.#logger.info('Terminating service');
-        this.#terminated = true;
-        this.#disconnect();
-        if (this.#reconnectTimer !== null) {
-            clearTimeout(this.#reconnectTimer);
-            this.#reconnectTimer = null;
-        }
-    }
-
-    /**
      * Attempts to connect to the WebSocket server.
      */
     #connect() {
@@ -285,7 +265,7 @@ export class Service extends EventEmitter {
      * Schedules the next reconnection attempt with exponential backoff.
      */
     #scheduleReconnect() {
-        if (this.#terminated || this.#reconnectTimer !== null) {
+        if (this.#reconnectTimer !== null) {
             return;
         }
 
@@ -294,7 +274,11 @@ export class Service extends EventEmitter {
 
         this.#reconnectTimer = setTimeout(() => {
             this.#reconnectTimer = null; // Allow new attempt
-            this.#connect();
+            // The last subscription may have left during the backoff, and
+            // nothing would then close the socket.
+            if (this.#subscriptions.size > 0) {
+                this.#connect();
+            }
         }, delay);
     }
 

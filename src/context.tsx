@@ -1,4 +1,4 @@
-import React, { createContext, useEffect, useRef } from 'react';
+import React, { createContext, useMemo } from 'react';
 import { Service } from './service';
 import { Level } from './logger';
 
@@ -11,18 +11,10 @@ export type HedwigProviderProps = {
 }
 
 export function HedwigProvider({ url, verbosity, children }: HedwigProviderProps) {
-    const service = useRef<Service | null>(null);
-    if (service.current === null) {
-        service.current = new Service(url, verbosity);
-    }
-
-    // FIXME: Changing any of the props will not reset the service instance.
-    // There should never be a reason to change the URL or verbosity anyway...
-
-    useEffect(() => () => service.current!.terminate(), []);
+    const service = useMemo(() => new Service(url, verbosity), [url, verbosity]);
 
     return (
-        <Context.Provider value={service.current}>
+        <Context.Provider value={service}>
             {children}
         </Context.Provider>
     );
