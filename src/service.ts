@@ -1,6 +1,6 @@
 import { Features, HedwigToken } from './token';
 import { Call, Claims, ClientCalls, ClientMessageMap, ClientOp, ErrorCode, ServerEvent, Feature, ServerMessage, ServerResultFor, ErrorCodeName } from './proto';
-import { Promise_withResolvers, PromiseWithResolvers, sleep } from './util';
+import { abortable, Promise_withResolvers, PromiseWithResolvers, sleep } from './util';
 import { ConsoleLogger, Level, Logger } from './logger';
 
 /** A function that produce a token for a subscription */
@@ -93,17 +93,25 @@ export class Service extends EventEmitter {
     /**
      * Returns a promise that will be resolved when the service gets connected.
      *
-     * If `signal` is aborted before the promise resolves, the promise will
-     * never be resolved, but the underlying event listener will be cancelled.
+     * If `signal` is aborted before the promise resolves, the promise is
+     * rejected with its reason, so that a subscription canceled while waiting
+     * still reaches the end of its lifecycle and leaves the service.
      */
     upPromise(signal: AbortSignal): Promise<void> {
         if (this.isConnected) {
             return Promise.resolve();
-        } else {
-            return new Promise(resolve => {
-                this.addEventListener(ServerEvent.SocketUp, () => resolve(), { once: true, signal });
-            });
         }
+        if (signal.aborted) {
+            return Promise.reject(signal.reason);
+        }
+        return new Promise((resolve, reject) => {
+            const onAbort = () => reject(signal.reason);
+            signal.addEventListener('abort', onAbort, { once: true });
+            this.addEventListener(ServerEvent.SocketUp, () => {
+                signal.removeEventListener('abort', onAbort);
+                resolve();
+            }, { once: true, signal });
+        });
     }
 
     /**
@@ -453,28 +461,6 @@ class Channel extends EventEmitter {
         }
     }
 
-    /** @see Service.upPromise() */
-    upPromise(signal: AbortSignal): Promise<void> {
-        if (this.#isConnected) {
-            return Promise.resolve();
-        } else {
-            return new Promise(resolve => {
-                this.addEventListener(ServerEvent.ChannelUp, () => resolve(), { once: true, signal });
-            });
-        }
-    }
-
-    /** @see Service.downSignal() */
-    downSignal(signal: AbortSignal): AbortSignal {
-        if (!this.#isConnected) {
-            return AbortSignal.abort(ERR_DISCONNECTED);
-        } else {
-            const controller = new AbortController();
-            this.addEventListener(ServerEvent.ChannelDown, () => controller.abort(), { once: true, signal });
-            return controller.signal;
-        }
-    }
-
     /** Adds a subscription to this channel. */
     addSubscription(sub: Subscription) {
         this.#subscriptions.add(sub);
@@ -603,6 +589,7 @@ class Subscription extends EventEmitter {
 
             // Retrieve the initial token for this subscription.
             let token = await this.#fetchToken(undefined, 10);
+            this.signal.throwIfAborted();
             this.service.updateSubscription(this, token);
 
             // From now on, every time the socket is established, we will
@@ -650,6 +637,7 @@ class Subscription extends EventEmitter {
 
                         this.#logger.debug('Renewing subscription token');
                         token = await this.#fetchToken(signal);
+                        this.signal.throwIfAborted();
                         tokenWasForgotten = false; // Reset the flag after a successful fetch
                         this.service.updateSubscription(this, token);
                     }
@@ -686,7 +674,15 @@ class Subscription extends EventEmitter {
             this.signal.throwIfAborted();
 
             try {
-                const rawToken = await this.authorizer(AbortSignal.any([signal, AbortSignal.timeout(5000)]));
+                // The authorizer may ignore its signal: without the race, a
+                // canceled subscription would wait for it, possibly forever,
+                // before leaving the service. Only the cancellation ends the
+                // wait: a renewal that answers after the token expired still
+                // brings a token to join with.
+                const rawToken = await abortable(
+                    Promise.resolve(this.authorizer(AbortSignal.any([signal, AbortSignal.timeout(5000)]))),
+                    this.signal,
+                );
                 const token = new HedwigToken(rawToken);
                 this.#logger.prefix = `S:${this.#subscriptionId}:${token.channel}`;
                 return token;
