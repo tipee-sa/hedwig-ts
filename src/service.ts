@@ -132,7 +132,7 @@ export class Service extends EventEmitter {
      * for possible channel change from the backend. Known multiple uses of the
      * same channel should instead share a single subscription.
      */
-    subscribe(signal: AbortSignal, authorizer: Authorizer): SubscriptionHandle {
+    subscribe(handle: SubscriptionHandle, signal: AbortSignal, authorizer: Authorizer): void {
         if (this.#terminated) {
             throw new Error('Service has been terminated');
         }
@@ -143,11 +143,9 @@ export class Service extends EventEmitter {
             this.#gracefulDisconnectTimer = null;
         }
 
-        const subscription = new Subscription(this, signal, authorizer);
+        const subscription = new Subscription(this, signal, authorizer, handle);
         this.#subscriptions.add(subscription);
         this.#connect();
-
-        return new SubscriptionHandle(subscription);
     }
 
     /**
@@ -548,9 +546,10 @@ class Channel extends EventEmitter {
 }
 
 /**
- * A Subscription is a single lease on a channel. It maps 1:1 to a `useChannel`
- * hook from the public API, and is responsible for managing the lifetime of
- * the subscription, including renewing the token and handling reconnection.
+ * A Subscription is a single lease on a channel. `useChannel` creates one each
+ * time its effect runs, and binds it to its handle, which outlives it. It is
+ * responsible for managing the lifetime of the subscription, including
+ * renewing the token and handling reconnection.
  */
 class Subscription extends EventEmitter {
     static #nextSubscriptionId = 0;
@@ -565,15 +564,24 @@ class Subscription extends EventEmitter {
         readonly service: Service,
         readonly signal: AbortSignal,
         readonly authorizer: Authorizer,
+        readonly handle: SubscriptionHandle,
     ) {
         super();
         this.#logger = service.makeLogger(`S:${this.#subscriptionId}`);
+        handle.bind(this);
         this.#run(); // Async
 
         // Reset the local claims when the channel claims are updated.
         this.addEventListener(ServerEvent.ChannelClaims, () => {
             this.#claims = NO_CLAIMS;
         });
+    }
+
+    /** Dispatches to this subscription's listeners, then to its handle's. */
+    override dispatchEvent(event: string, detail: unknown): boolean {
+        const result = super.dispatchEvent(event, detail);
+        this.handle.relay(this, event, detail);
+        return result;
     }
 
     /** The bound channel, if any */
@@ -724,56 +732,87 @@ class Subscription extends EventEmitter {
 
 /**
  * A SubscriptionHandle is the public API for a subscription.
- * It is returned by the [`Service.subscribe`] method.
+ * It is returned by `useChannel`.
+ *
+ * Listeners belong to the handle, which relays them the events of the
+ * subscription it stands for. While that subscription is missing or canceled,
+ * the handle reads as not connected, with no presence and no claims, and
+ * acquiring a claim resolves to `false`.
  */
 export class SubscriptionHandle {
-    /** The internal subscription state */
-    #subscription: Subscription;
+    /** The subscription the handle stands for, if any */
+    #subscription: Subscription | null = null;
+
+    /** The handle's listeners */
+    readonly #emitter: EventEmitter = new (class extends EventEmitter {})();
 
     /** @internal */
-    constructor(subscription: Subscription) {
+    bind(subscription: Subscription): void {
         this.#subscription = subscription;
     }
 
-    /** Returns whether the subscription is canceled. */
+    /** @internal */
+    relay(from: Subscription, event: string, detail: unknown): void {
+        if (from === this.#subscription && !from.signal.aborted) {
+            this.#emitter.dispatchEvent(event, detail);
+        }
+    }
+
+    /** The subscription the handle stands for, unless it is missing or canceled */
+    get #live(): Subscription | null {
+        const subscription = this.#subscription;
+        return subscription !== null && !subscription.signal.aborted ? subscription : null;
+    }
+
+    /**
+     * Returns whether the subscription the handle stands for is canceled.
+     *
+     * @deprecated The handle outlives its subscriptions: when `useChannel`
+     * subscribes again with the same handle, as StrictMode does right after
+     * mounting, the effects of child components run in between and read
+     * `true`. Listeners can be added regardless, as the handle relays the
+     * events of each subscription it is bound to.
+     */
     get canceled(): boolean {
-        return this.#subscription.signal.aborted;
+        return this.#subscription?.signal.aborted ?? false;
     }
 
     get isConnected(): boolean {
-        return this.#subscription.isConnected;
+        return this.#live?.isConnected ?? false;
     }
 
-    /** Adds an event listener to the subscription. */
+    /**
+     * Adds an event listener to the handle. It receives the events of the
+     * subscription the handle stands for when they happen.
+     */
     addEventListener<E>(
         type: string,
         callback: (ev: CustomEvent<E>) => void,
         options?: AddEventListenerOptions
     ): void {
-        if (this.canceled) {
-            throw new Error('Cannot add event listener to a canceled subscription');
-        }
-        this.#subscription.addEventListener(type, callback as EventListener, options);
+        this.#emitter.addEventListener(type, callback as (e: CustomEvent) => void, options);
     }
 
     /* CLAIMS */
 
     get claims(): Claims {
-        return this.#subscription.claims;
+        return this.#live?.claims ?? { claims: {}, own: [] };
     }
 
     claimAcquire(resource: string, force: boolean): Promise<boolean> {
-        return this.#subscription.claimAcquire(resource, force);
+        return this.#live?.claimAcquire(resource, force) ?? Promise.resolve(false);
     }
 
     claimRelease(resource: string): Promise<boolean> {
-        return this.#subscription.claimRelease(resource);
+        // Goes through the subscription even once canceled: on unmount, the
+        // parent's `useChannel` cancels it before the child releases its claim.
+        return this.#subscription?.claimRelease(resource) ?? Promise.resolve(false);
     }
 
     /* PRESENCE */
 
     get presence(): string[] {
-        return this.#subscription.channel?.presence ?? [];
+        return this.#live?.channel?.presence ?? [];
     }
 }
 
