@@ -1,6 +1,6 @@
 import { Features, HedwigToken } from './token';
 import { Call, Claims, ClientCalls, ClientMessageMap, ClientOp, ErrorCode, ServerEvent, Feature, ServerMessage, ServerResultFor, ErrorCodeName } from './proto';
-import { Promise_withResolvers, PromiseWithResolvers, sleep } from './util';
+import { abortable, Promise_withResolvers, PromiseWithResolvers, sleep } from './util';
 import { ConsoleLogger, Level, Logger } from './logger';
 
 /** A function that produce a token for a subscription */
@@ -42,6 +42,9 @@ export abstract class EventEmitter {
  * same channel.
  */
 export class Service extends EventEmitter {
+    /** The root logger, whose verbosity applies to every logger derived from it */
+    readonly #rootLogger: ConsoleLogger;
+
     /** The logger instance */
     readonly #logger: Logger;
 
@@ -72,12 +75,19 @@ export class Service extends EventEmitter {
     /** Timer for scheduling a graceful disconnect when no subscriptions are active */
     #gracefulDisconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-    /** Indicates whether the service has been terminated */
-    #terminated: boolean = false;
-
     constructor(public url: string, verbosity: Level = Level.Essential) {
         super();
-        this.#logger = new ConsoleLogger(verbosity).withPrefix('Hedwig');
+        this.#rootLogger = new ConsoleLogger(verbosity);
+        this.#logger = this.#rootLogger.withPrefix('Hedwig');
+    }
+
+    /** The verbosity of the logs, for the service and all its subscriptions. */
+    get verbosity(): Level {
+        return this.#rootLogger.verbosity;
+    }
+
+    set verbosity(verbosity: Level) {
+        this.#rootLogger.verbosity = verbosity;
     }
 
     /** Whether the service is connected to the backend. */
@@ -93,17 +103,25 @@ export class Service extends EventEmitter {
     /**
      * Returns a promise that will be resolved when the service gets connected.
      *
-     * If `signal` is aborted before the promise resolves, the promise will
-     * never be resolved, but the underlying event listener will be cancelled.
+     * If `signal` is aborted before the promise resolves, the promise is
+     * rejected with its reason, so that a subscription canceled while waiting
+     * still reaches the end of its lifecycle and leaves the service.
      */
     upPromise(signal: AbortSignal): Promise<void> {
         if (this.isConnected) {
             return Promise.resolve();
-        } else {
-            return new Promise(resolve => {
-                this.addEventListener(ServerEvent.SocketUp, () => resolve(), { once: true, signal });
-            });
         }
+        if (signal.aborted) {
+            return Promise.reject(signal.reason);
+        }
+        return new Promise((resolve, reject) => {
+            const onAbort = () => reject(signal.reason);
+            signal.addEventListener('abort', onAbort, { once: true });
+            this.addEventListener(ServerEvent.SocketUp, () => {
+                signal.removeEventListener('abort', onAbort);
+                resolve();
+            }, { once: true, signal });
+        });
     }
 
     /**
@@ -132,22 +150,16 @@ export class Service extends EventEmitter {
      * for possible channel change from the backend. Known multiple uses of the
      * same channel should instead share a single subscription.
      */
-    subscribe(signal: AbortSignal, authorizer: Authorizer): SubscriptionHandle {
-        if (this.#terminated) {
-            throw new Error('Service has been terminated');
-        }
-
+    subscribe(handle: SubscriptionHandle, signal: AbortSignal, authorizer: Authorizer): void {
         // If a graceful disconnect was scheduled, cancel it
         if (this.#gracefulDisconnectTimer !== null) {
             clearTimeout(this.#gracefulDisconnectTimer);
             this.#gracefulDisconnectTimer = null;
         }
 
-        const subscription = new Subscription(this, signal, authorizer);
+        const subscription = new Subscription(this, signal, authorizer, handle);
         this.#subscriptions.add(subscription);
         this.#connect();
-
-        return new SubscriptionHandle(subscription);
     }
 
     /**
@@ -246,19 +258,6 @@ export class Service extends EventEmitter {
     }
 
     /**
-     * Terminates the service, closing the WebSocket connection and channels.
-     */
-    terminate() {
-        this.#logger.info('Terminating service');
-        this.#terminated = true;
-        this.#disconnect();
-        if (this.#reconnectTimer !== null) {
-            clearTimeout(this.#reconnectTimer);
-            this.#reconnectTimer = null;
-        }
-    }
-
-    /**
      * Attempts to connect to the WebSocket server.
      */
     #connect() {
@@ -279,7 +278,7 @@ export class Service extends EventEmitter {
      * Schedules the next reconnection attempt with exponential backoff.
      */
     #scheduleReconnect() {
-        if (this.#terminated || this.#reconnectTimer !== null) {
+        if (this.#reconnectTimer !== null) {
             return;
         }
 
@@ -288,7 +287,11 @@ export class Service extends EventEmitter {
 
         this.#reconnectTimer = setTimeout(() => {
             this.#reconnectTimer = null; // Allow new attempt
-            this.#connect();
+            // The last subscription may have left during the backoff, and
+            // nothing would then close the socket.
+            if (this.#subscriptions.size > 0) {
+                this.#connect();
+            }
         }, delay);
     }
 
@@ -455,31 +458,17 @@ class Channel extends EventEmitter {
         }
     }
 
-    /** @see Service.upPromise() */
-    upPromise(signal: AbortSignal): Promise<void> {
-        if (this.#isConnected) {
-            return Promise.resolve();
-        } else {
-            return new Promise(resolve => {
-                this.addEventListener(ServerEvent.ChannelUp, () => resolve(), { once: true, signal });
-            });
-        }
-    }
-
-    /** @see Service.downSignal() */
-    downSignal(signal: AbortSignal): AbortSignal {
-        if (!this.#isConnected) {
-            return AbortSignal.abort(ERR_DISCONNECTED);
-        } else {
-            const controller = new AbortController();
-            this.addEventListener(ServerEvent.ChannelDown, () => controller.abort(), { once: true, signal });
-            return controller.signal;
-        }
-    }
-
     /** Adds a subscription to this channel. */
     addSubscription(sub: Subscription) {
         this.#subscriptions.add(sub);
+
+        // Joining a channel that is already connected changes none of its
+        // state, so no event would tell the new subscription about it.
+        if (this.#isConnected) {
+            sub.dispatchEvent(ServerEvent.ChannelUp, undefined);
+            sub.dispatchEvent(ServerEvent.ChannelPresence, this.#presence);
+            sub.dispatchEvent(ServerEvent.ChannelClaims, this.#claims);
+        }
     }
 
     /** Removes a subscription from this channel. */
@@ -548,9 +537,10 @@ class Channel extends EventEmitter {
 }
 
 /**
- * A Subscription is a single lease on a channel. It maps 1:1 to a `useChannel`
- * hook from the public API, and is responsible for managing the lifetime of
- * the subscription, including renewing the token and handling reconnection.
+ * A Subscription is a single lease on a channel. `useChannel` creates one each
+ * time its effect runs, and binds it to its handle, which outlives it. It is
+ * responsible for managing the lifetime of the subscription, including
+ * renewing the token and handling reconnection.
  */
 class Subscription extends EventEmitter {
     static #nextSubscriptionId = 0;
@@ -565,15 +555,24 @@ class Subscription extends EventEmitter {
         readonly service: Service,
         readonly signal: AbortSignal,
         readonly authorizer: Authorizer,
+        readonly handle: SubscriptionHandle,
     ) {
         super();
         this.#logger = service.makeLogger(`S:${this.#subscriptionId}`);
+        handle.bind(this);
         this.#run(); // Async
 
         // Reset the local claims when the channel claims are updated.
         this.addEventListener(ServerEvent.ChannelClaims, () => {
             this.#claims = NO_CLAIMS;
         });
+    }
+
+    /** Dispatches to this subscription's listeners, then to its handle's. */
+    override dispatchEvent(event: string, detail: unknown): boolean {
+        const result = super.dispatchEvent(event, detail);
+        this.handle.relay(this, event, detail);
+        return result;
     }
 
     /** The bound channel, if any */
@@ -595,6 +594,7 @@ class Subscription extends EventEmitter {
 
             // Retrieve the initial token for this subscription.
             let token = await this.#fetchToken(undefined, 10);
+            this.signal.throwIfAborted();
             this.service.updateSubscription(this, token);
 
             // From now on, every time the socket is established, we will
@@ -642,6 +642,7 @@ class Subscription extends EventEmitter {
 
                         this.#logger.debug('Renewing subscription token');
                         token = await this.#fetchToken(signal);
+                        this.signal.throwIfAborted();
                         tokenWasForgotten = false; // Reset the flag after a successful fetch
                         this.service.updateSubscription(this, token);
                     }
@@ -678,7 +679,15 @@ class Subscription extends EventEmitter {
             this.signal.throwIfAborted();
 
             try {
-                const rawToken = await this.authorizer(AbortSignal.any([signal, AbortSignal.timeout(5000)]));
+                // The authorizer may ignore its signal: without the race, a
+                // canceled subscription would wait for it, possibly forever,
+                // before leaving the service. Only the cancellation ends the
+                // wait: a renewal that answers after the token expired still
+                // brings a token to join with.
+                const rawToken = await abortable(
+                    Promise.resolve(this.authorizer(AbortSignal.any([signal, AbortSignal.timeout(5000)]))),
+                    this.signal,
+                );
                 const token = new HedwigToken(rawToken);
                 this.#logger.prefix = `S:${this.#subscriptionId}:${token.channel}`;
                 return token;
@@ -724,56 +733,87 @@ class Subscription extends EventEmitter {
 
 /**
  * A SubscriptionHandle is the public API for a subscription.
- * It is returned by the [`Service.subscribe`] method.
+ * It is returned by `useChannel`.
+ *
+ * Listeners belong to the handle, which relays them the events of the
+ * subscription it stands for. While that subscription is missing or canceled,
+ * the handle reads as not connected, with no presence and no claims, and
+ * acquiring a claim resolves to `false`.
  */
 export class SubscriptionHandle {
-    /** The internal subscription state */
-    #subscription: Subscription;
+    /** The subscription the handle stands for, if any */
+    #subscription: Subscription | null = null;
+
+    /** The handle's listeners */
+    readonly #emitter: EventEmitter = new (class extends EventEmitter {})();
 
     /** @internal */
-    constructor(subscription: Subscription) {
+    bind(subscription: Subscription): void {
         this.#subscription = subscription;
     }
 
-    /** Returns whether the subscription is canceled. */
+    /** @internal */
+    relay(from: Subscription, event: string, detail: unknown): void {
+        if (from === this.#subscription && !from.signal.aborted) {
+            this.#emitter.dispatchEvent(event, detail);
+        }
+    }
+
+    /** The subscription the handle stands for, unless it is missing or canceled */
+    get #live(): Subscription | null {
+        const subscription = this.#subscription;
+        return subscription !== null && !subscription.signal.aborted ? subscription : null;
+    }
+
+    /**
+     * Returns whether the subscription the handle stands for is canceled.
+     *
+     * @deprecated The handle outlives its subscriptions: when `useChannel`
+     * subscribes again with the same handle, as StrictMode does right after
+     * mounting, the effects of child components run in between and read
+     * `true`. Listeners can be added regardless, as the handle relays the
+     * events of each subscription it is bound to.
+     */
     get canceled(): boolean {
-        return this.#subscription.signal.aborted;
+        return this.#subscription?.signal.aborted ?? false;
     }
 
     get isConnected(): boolean {
-        return this.#subscription.isConnected;
+        return this.#live?.isConnected ?? false;
     }
 
-    /** Adds an event listener to the subscription. */
+    /**
+     * Adds an event listener to the handle. It receives the events of the
+     * subscription the handle stands for when they happen.
+     */
     addEventListener<E>(
         type: string,
         callback: (ev: CustomEvent<E>) => void,
         options?: AddEventListenerOptions
     ): void {
-        if (this.canceled) {
-            throw new Error('Cannot add event listener to a canceled subscription');
-        }
-        this.#subscription.addEventListener(type, callback as EventListener, options);
+        this.#emitter.addEventListener(type, callback as (e: CustomEvent) => void, options);
     }
 
     /* CLAIMS */
 
     get claims(): Claims {
-        return this.#subscription.claims;
+        return this.#live?.claims ?? { claims: {}, own: [] };
     }
 
     claimAcquire(resource: string, force: boolean): Promise<boolean> {
-        return this.#subscription.claimAcquire(resource, force);
+        return this.#live?.claimAcquire(resource, force) ?? Promise.resolve(false);
     }
 
     claimRelease(resource: string): Promise<boolean> {
-        return this.#subscription.claimRelease(resource);
+        // Goes through the subscription even once canceled: on unmount, the
+        // parent's `useChannel` cancels it before the child releases its claim.
+        return this.#subscription?.claimRelease(resource) ?? Promise.resolve(false);
     }
 
     /* PRESENCE */
 
     get presence(): string[] {
-        return this.#subscription.channel?.presence ?? [];
+        return this.#live?.channel?.presence ?? [];
     }
 }
 

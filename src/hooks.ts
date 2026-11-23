@@ -36,27 +36,20 @@ export function useChannel(
         throw new Error('useChannel must be used within a HedwigProvider');
     }
 
-    const ctrl = useRef<AbortController | null>(null);
-    if (ctrl.current === null) {
-        ctrl.current = new AbortController();
-    }
-
-    const [subscription, setSubscription] = useState<SubscriptionHandle>(
-        () => service.subscribe(ctrl.current!.signal, authorizer),
-    );
+    // Building a handle has no side effect, so a render React discards leaves
+    // nothing behind. A new handle per channel lets the hooks reading it start over.
+    const handle = useMemo(() => new SubscriptionHandle(), [service, ...deps]);
 
     useEffect(
         () => {
-            if (ctrl.current!.signal.aborted) {
-                ctrl.current = new AbortController();
-                setSubscription(service.subscribe(ctrl.current.signal, authorizer));
-            }
-            return () => ctrl.current?.abort();
+            const ctrl = new AbortController();
+            service.subscribe(handle, ctrl.signal, authorizer);
+            return () => ctrl.abort();
         },
-        [service, ...deps], // Not including `authorizer`, as its dependencies should already be in `deps`
+        [service, handle], // Not including `authorizer`, as its dependencies should already be in `deps`
     );
 
-    return subscription;
+    return handle;
 }
 
 /**
@@ -70,7 +63,6 @@ export function useChannelStatus(
 
     useAbortableEffect(
         (signal) => {
-            if (subscription.canceled) return;
             setState(subscription.isConnected);
             subscription.addEventListener(ServerEvent.ChannelUp, () => setState(subscription.isConnected), { signal });
             subscription.addEventListener(ServerEvent.ChannelDown, () => setState(subscription.isConnected), { signal });
@@ -95,7 +87,6 @@ export function useChannelEvent(
 ) {
     useAbortableEffect(
         (signal) => {
-            if (subscription.canceled) return;
             subscription.addEventListener(ServerEvent.ChannelEvent, ({ detail }) => handler(detail), { signal });
         },
         [subscription, ...deps], // Not including `handler`, as its dependencies should already be in `deps`
@@ -116,7 +107,6 @@ export function useChannelPresence(
 
     useAbortableEffect(
         (signal) => {
-            if (subscription.canceled) return;
             setPresence(subscription.presence);
             subscription.addEventListener<string[]>(ServerEvent.ChannelPresence, ({ detail }) => setPresence(detail), { signal });
         },
@@ -150,6 +140,10 @@ export function useChannelPresence(
  * If Hedwig is unavailable, `claim.acquire` and `claim.release` will emulate
  * the claim logic locally. In this case, the returned owner might be an empty
  * string instead of a valid identifier.
+ *
+ * The handle gets its subscription in the effect of `useChannel`, which runs
+ * after the effects of the components it renders. An acquisition made before,
+ * such as in a child's mount effect, resolves to `false` and emulates nothing.
  */
 export function useChannelClaim(
     subscription: SubscriptionHandle,
@@ -168,12 +162,15 @@ export function useChannelClaim(
 
     useAbortableEffect(
         (signal) => {
-            if (subscription.canceled) return;
-            subscription.addEventListener<Claims>(ServerEvent.ChannelClaims, ({ detail }) => {
-                const owner = detail.claims[resource];
-                owned.current = owner !== undefined && detail.own.includes(resource);
+            const update = (claims: Claims) => {
+                const owner = claims.claims[resource];
+                owned.current = owner !== undefined && claims.own.includes(resource);
                 setOwner(owner === undefined ? undefined : [owner, owned.current]);
-            }, { signal });
+            };
+            // The state is only initialized on the first render: the handle or
+            // the resource may have changed since.
+            update(subscription.claims);
+            subscription.addEventListener<Claims>(ServerEvent.ChannelClaims, ({ detail }) => update(detail), { signal });
         },
         [subscription, resource]
     );
@@ -181,7 +178,9 @@ export function useChannelClaim(
     // On unmount or when the resource changes, release the claim.
     useEffect(() => {
         return () => {
-            owned.current && subscription.claimRelease(resource);
+            // Nobody is left to handle a failure, such as the socket dropping
+            // before the server answers.
+            owned.current && subscription.claimRelease(resource).catch(() => {});
             owned.current = false;
         };
     }, [subscription, resource]);

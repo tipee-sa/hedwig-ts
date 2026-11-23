@@ -1,13 +1,16 @@
-export function abortPromise(signal: AbortSignal): Promise<void> {
+/**
+ * Settles as `promise` does, unless `signal` aborts first, which rejects with
+ * its reason. The abort listener is removed once either happens, so that a
+ * long-lived signal does not collect one listener per call.
+ */
+export function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
     if (signal.aborted) {
         return Promise.reject(signal.reason);
     }
-    return new Promise((_, reject) => {
-        if (signal.aborted) {
-            reject(signal.reason);
-        } else {
-            signal.addEventListener('abort', () => reject(signal.reason), { once: true });
-        }
+    return new Promise<T>((resolve, reject) => {
+        const onAbort = () => reject(signal.reason);
+        signal.addEventListener('abort', onAbort, { once: true });
+        promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
     });
 }
 
@@ -15,10 +18,10 @@ export function sleep(delay: number, signal?: AbortSignal): Promise<void> {
     const { promise, resolve } = Promise_withResolvers<void>();
     const timeout = setTimeout(resolve, delay);
 
-    return !signal ? promise : Promise.race([
-        abortPromise(signal).finally(() => clearTimeout(timeout)),
-        promise,
-    ]);
+    return !signal ? promise : abortable(promise, signal).catch(err => {
+        clearTimeout(timeout);
+        throw err;
+    });
 }
 
 
