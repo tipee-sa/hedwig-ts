@@ -42,6 +42,9 @@ export abstract class EventEmitter {
  * same channel.
  */
 export class Service extends EventEmitter {
+    /** The root logger, whose verbosity applies to every logger derived from it */
+    readonly #rootLogger: ConsoleLogger;
+
     /** The logger instance */
     readonly #logger: Logger;
 
@@ -74,7 +77,17 @@ export class Service extends EventEmitter {
 
     constructor(public url: string, verbosity: Level = Level.Essential) {
         super();
-        this.#logger = new ConsoleLogger(verbosity).withPrefix('Hedwig');
+        this.#rootLogger = new ConsoleLogger(verbosity);
+        this.#logger = this.#rootLogger.withPrefix('Hedwig');
+    }
+
+    /** The verbosity of the logs, for the service and all its subscriptions. */
+    get verbosity(): Level {
+        return this.#rootLogger.verbosity;
+    }
+
+    set verbosity(verbosity: Level) {
+        this.#rootLogger.verbosity = verbosity;
     }
 
     /** Whether the service is connected to the backend. */
