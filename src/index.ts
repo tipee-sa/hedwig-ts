@@ -1,4 +1,11 @@
-export { HedwigProvider } from './context';
-export { useChannel, useChannelStatus, useChannelEvent, useChannelPresence, useChannelClaim } from './hooks';
-export { Level as Verbosity } from './logger';
-export { SubscriptionHandle } from './service';
+export { HedwigProvider } from './react/context';
+export { useChannel } from './react/hooks/useChannel';
+export { useChannels } from './react/hooks/useChannels';
+export { useChannelStatus } from './react/hooks/useChannelStatus';
+export { useChannelEvent } from './react/hooks/useChannelEvent';
+export { useChannelsEvent } from './react/hooks/useChannelsEvent';
+export { useChannelPresence } from './react/hooks/useChannelPresence';
+export { useChannelClaim } from './react/hooks/useChannelClaim';
+export { Level as Verbosity } from './core/logger';
+export { SubscriptionHandle } from './core/service/subscriptionHandle';
+export type { Authorizer } from './core/service/subscription';
